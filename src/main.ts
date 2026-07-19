@@ -12,6 +12,7 @@ let progressText: HTMLDivElement;
 let currentViewer: Viewer;
 let currentCamera: Camera;
 let mainInfoDisplay: HTMLElement;
+let requestedShDegree: number | null = null;
 
 // Create a function to initialize the progress bar
 function createProgressBar() {
@@ -75,11 +76,37 @@ function resetProgress() {
   progressText.textContent = 'Loading PLY file... 0%';
 }
 
+function parseIndexList(value: string | null, expectedLength: number, maxIndex: number): number[] | null {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = value
+    .split(',')
+    .map((v) => Number.parseInt(v.trim(), 10))
+    .filter((v) => Number.isFinite(v));
+
+  if (parsed.length !== expectedLength) {
+    return null;
+  }
+
+  for (const v of parsed) {
+    if (v < 0 || v > maxIndex) {
+      return null;
+    }
+  }
+
+  return parsed;
+}
+
 // Process PLY data after loading
 function processPLYData(plyData: any, fileName: string, loadTime: string, fileSize?: number, infoElement?: HTMLElement) {
   if (plyData.sceneCenter && plyData.sceneExtent) {
     currentViewer.setSceneParameters(plyData.sceneCenter, plyData.sceneExtent);
   }
+
+  const activeShDegree = requestedShDegree ?? plyData.activeShDegree ?? 1;
+  currentViewer.setShDegree(activeShDegree);
 
   currentViewer.loadPointCloud(
     plyData.vertices,
@@ -110,14 +137,19 @@ function processPLYData(plyData: any, fileName: string, loadTime: string, fileSi
     infoElement.textContent = infoText;
   }
 
-  currentViewer.setSceneTransformMatrix([0.9964059591293335,0.07686585187911987,0.03559183329343796,0,0.06180455908179283,-0.9470552206039429,0.3150659501552582,0,0.05792524665594101,-0.3117338716983795,-0.9484022259712219,0,0,0,0,1]);
-  
+  // Keep the model in its original orientation by default.
+  // Hardcoded transforms/camera presets can place non-pumpkin scenes outside the frustum.
   if (plyData.sceneCenter && plyData.sceneExtent) {
-    currentCamera.setPosition(-5.3627543449401855,-0.40146273374557495,3.546692371368408);      
+    const defaultDistance = Math.min(Math.max(plyData.sceneExtent * 0.02, 2.5), 10.0);
     currentCamera.setTarget(
       plyData.sceneCenter[0],
       plyData.sceneCenter[1],
       plyData.sceneCenter[2]
+    );
+    currentCamera.setPosition(
+      plyData.sceneCenter[0],
+      plyData.sceneCenter[1],
+      plyData.sceneCenter[2] + defaultDistance
     );
   }
 }
@@ -340,8 +372,143 @@ document.addEventListener('DOMContentLoaded', async () => {
   
   // Get URL parameters
   const urlParams = new URLSearchParams(window.location.search);
-  const plyUrl = urlParams.get('url') || 'https://huggingface.co/samuelm2/voxel-data/resolve/main/pumpkin_600k.ply';
+  const qualityPreset = (urlParams.get('quality') || '').toLowerCase();
+  const plyUrl = urlParams.get('url') || '/models/SVRaster/bonsai_og/checkpoints/iter020000_model.ply';
   const showLoadingUI = urlParams.get('showLoadingUI') === 'true';
+  const shDegreeParam = urlParams.get('sh');
+  if (shDegreeParam !== null) {
+    const shDegree = parseInt(shDegreeParam, 10);
+    requestedShDegree = Number.isFinite(shDegree) ? shDegree : null;
+    if (requestedShDegree !== null) {
+      viewer.setShDegree(requestedShDegree);
+    }
+  }
+
+  if (qualityPreset === 'preview') {
+    viewer.setRenderScale(0.7);
+    viewer.setVoxelScaleMultiplier(0.98);
+  } else if (qualityPreset === 'detail') {
+    viewer.setRenderScale(1.0);
+    viewer.setDensityTransferMode('linear');
+    viewer.setDensityThreshold(0.08);
+    viewer.setVoxelScaleMultiplier(0.92);
+    viewer.setStepScale(120.0);
+  }
+
+  const disableSh2 = urlParams.get('disableSh2');
+  if (disableSh2 !== null) {
+    viewer.setDisableSh2(disableSh2 !== '0' && disableSh2.toLowerCase() !== 'false');
+  }
+
+  const shViewDir = urlParams.get('shViewDir');
+  if (shViewDir !== null) {
+    viewer.setUseVoxelToCameraShDir(shViewDir.toLowerCase() === 'voxeltocamera');
+  }
+
+  const shDebug = urlParams.get('shDebug');
+  if (shDebug !== null) {
+    const normalizedShDebug = shDebug.toLowerCase();
+    if (normalizedShDebug === 'degdiff13') {
+      viewer.setShComparisonMode('degdiff13');
+    } else if (normalizedShDebug === 'dirdiff') {
+      viewer.setShComparisonMode('dirdiff');
+    } else {
+      viewer.setShComparisonMode('normal');
+    }
+  }
+
+  const shDiffScale = Number.parseFloat(urlParams.get('shDiffScale') || '');
+  if (Number.isFinite(shDiffScale)) {
+    viewer.setShDirDiffScale(shDiffScale);
+  }
+
+  const renderDebug = urlParams.get('renderDebug');
+  if (renderDebug !== null) {
+    const normalizedRenderDebug = renderDebug.toLowerCase();
+    if (normalizedRenderDebug === 'alpha') {
+      viewer.setDebugRenderMode('alpha');
+    } else if (normalizedRenderDebug === 'thickness') {
+      viewer.setDebugRenderMode('thickness');
+    } else if (normalizedRenderDebug === 'solid') {
+      viewer.setDebugRenderMode('solid');
+    } else if (normalizedRenderDebug === 'rawdensity') {
+      viewer.setDebugRenderMode('rawdensity');
+    } else {
+      viewer.setDebugRenderMode('normal');
+    }
+  }
+
+  const stepScale = Number.parseFloat(urlParams.get('stepScale') || '');
+  if (Number.isFinite(stepScale)) {
+    viewer.setStepScale(stepScale);
+  }
+
+  const sortMode = urlParams.get('sort');
+  if (sortMode !== null) {
+    viewer.setSortingEnabled(sortMode !== '0' && sortMode.toLowerCase() !== 'false' && sortMode.toLowerCase() !== 'off');
+  }
+
+  const densityMode = urlParams.get('densityMode');
+  if (densityMode !== null) {
+    viewer.setDensityMode(densityMode.toLowerCase() === 'flat' ? 'flat' : 'trilinear');
+  }
+
+  const densityTransfer = urlParams.get('densityTransfer');
+  if (densityTransfer !== null) {
+    const normalizedDensityTransfer = densityTransfer.toLowerCase();
+    if (normalizedDensityTransfer === 'linear') {
+      viewer.setDensityTransferMode('linear');
+    } else if (normalizedDensityTransfer === 'exp') {
+      viewer.setDensityTransferMode('exp');
+    } else {
+      viewer.setDensityTransferMode('explin');
+    }
+  }
+
+  const densityThreshold = Number.parseFloat(urlParams.get('densityThreshold') || '');
+  if (Number.isFinite(densityThreshold)) {
+    viewer.setDensityThreshold(densityThreshold);
+  }
+
+  const rawDensityBias = Number.parseFloat(urlParams.get('rawDensityBias') || '');
+  if (Number.isFinite(rawDensityBias)) {
+    viewer.setRawDensityBias(rawDensityBias);
+  }
+
+  const rawDensityScale = Number.parseFloat(urlParams.get('rawDensityScale') || '');
+  if (Number.isFinite(rawDensityScale)) {
+    viewer.setRawDensityScale(rawDensityScale);
+  }
+
+  const renderScale = Number.parseFloat(urlParams.get('renderScale') || '');
+  if (Number.isFinite(renderScale)) {
+    viewer.setRenderScale(renderScale);
+  }
+
+  const blendMode = urlParams.get('blend');
+  if (blendMode !== null) {
+    viewer.setBlendingEnabled(blendMode !== '0' && blendMode.toLowerCase() !== 'false' && blendMode.toLowerCase() !== 'off');
+  }
+
+  const depthMode = urlParams.get('depth');
+  if (depthMode !== null) {
+    viewer.setDepthTestEnabled(depthMode === '1' || depthMode.toLowerCase() === 'true' || depthMode.toLowerCase() === 'on');
+  }
+
+  const voxelScale = Number.parseFloat(urlParams.get('voxelScale') || '');
+  if (Number.isFinite(voxelScale)) {
+    viewer.setVoxelScaleMultiplier(voxelScale);
+  }
+
+  const sh1Map = parseIndexList(urlParams.get('sh1map'), 3, 2);
+  if (sh1Map) {
+    viewer.setSh1BasisOrder(sh1Map);
+  }
+
+  const sh2Map = parseIndexList(urlParams.get('sh2map'), 5, 4);
+  if (sh2Map) {
+    viewer.setSh2BasisOrder(sh2Map);
+  }
 
   // Add UI controls and get info element
   const infoDisplay = addControls();

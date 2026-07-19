@@ -11,6 +11,52 @@ from functools import partial
 # Define constants
 MAX_NUM_LEVELS = 16
 
+
+def flatten_sh_rest(_shs: torch.Tensor, sh_layout: str = 'auto') -> np.ndarray:
+    """Flatten SH rest coefficients into basis-major RGB triplets.
+
+    Output order expected by viewer:
+      [b0.r, b0.g, b0.b, b1.r, b1.g, b1.b, ...]
+
+    _shs is commonly [N, B, 3] or [N, 3, B].
+    """
+    if _shs.ndim == 2:
+        # Already flattened [N, K]
+        return _shs.cpu().numpy()
+
+    if _shs.ndim != 3:
+        raise ValueError(f"Unsupported _shs shape: {_shs.shape}")
+
+    n, a, b = _shs.shape
+
+    if sh_layout == 'basis-major':
+        if b != 3:
+            raise ValueError(f"basis-major expects shape [N, B, 3], got {_shs.shape}")
+        sh_reordered = _shs
+    elif sh_layout == 'basis-major-transposed':
+        # Intentionally transpose [N, B, 3] -> [N, 3, B] and then flatten.
+        # This is useful for A/B validation when viewer mapping might expect the opposite order.
+        if b != 3:
+            raise ValueError(f"basis-major-transposed expects shape [N, B, 3], got {_shs.shape}")
+        sh_reordered = _shs.permute(0, 2, 1)
+    elif sh_layout == 'channel-major':
+        if a != 3:
+            raise ValueError(f"channel-major expects shape [N, 3, B], got {_shs.shape}")
+        sh_reordered = _shs.permute(0, 2, 1)
+    else:
+        # auto
+        if b == 3:
+            sh_reordered = _shs
+        elif a == 3:
+            sh_reordered = _shs.permute(0, 2, 1)
+        else:
+            raise ValueError(
+                f"Could not infer SH layout from shape {_shs.shape}. "
+                "Use --sh_layout basis-major or channel-major."
+            )
+
+    return sh_reordered.reshape(n, -1).cpu().numpy()
+
 def get_voxel_size(scene_extent, octlevel):
     '''The voxel size at the given levels.'''
     return np.ldexp(scene_extent, -octlevel)
@@ -136,7 +182,7 @@ def process_grid_values_batch(params):
             
     return (start_idx, result)
 
-def convert_to_ply(input_path, output_path, use_cpu=False):
+def convert_to_ply(input_path, output_path, use_cpu=False, sh_layout='auto'):
     """Convert a model.pt file to PLY format using numpy for memory efficiency"""
     print(f"Loading model from {input_path}...")
     
@@ -162,7 +208,9 @@ def convert_to_ply(input_path, output_path, use_cpu=False):
     
     _geo_grid_pts = _geo_grid_pts.cpu().numpy().squeeze()
     sh0_np = _sh0.cpu().numpy()
-    shs_np = _shs.reshape(_shs.shape[0], -1).cpu().numpy()
+    print(f"_shs raw shape: {tuple(_shs.shape)}")
+    print(f"Using SH layout: {sh_layout}")
+    shs_np = flatten_sh_rest(_shs, sh_layout=sh_layout)
     
     # Calculate derived values
     vox_center = octpath_decoding(octpath, octlevel, scene_center, scene_extent)
@@ -232,6 +280,13 @@ def main():
     parser = argparse.ArgumentParser(description='Convert sparse voxel model PT file to PLY format')
     parser.add_argument('input_path', type=str, help='Path to the model.pt file')
     parser.add_argument('output_path', type=str, help='Path where to save the PLY file')
+    parser.add_argument(
+        '--sh_layout',
+        type=str,
+        default='auto',
+        choices=['auto', 'basis-major', 'channel-major', 'basis-major-transposed'],
+        help='Layout of _shs tensor before flattening'
+    )
     
     args = parser.parse_args()
     
@@ -239,7 +294,7 @@ def main():
         # This is important for multiprocessing on Windows
         multiprocessing.freeze_support()
     
-    convert_to_ply(args.input_path, args.output_path)
+    convert_to_ply(args.input_path, args.output_path, sh_layout=args.sh_layout)
 
 if __name__ == "__main__":
     # This is important for multiprocessing on Windows

@@ -64,15 +64,17 @@ To run this project locally:
 - Right now, only scenes trained with spherical harmonic degree 1 are supported (so 12 total SH coefficients per voxel). See the command below to train your SVRaster scene with sh degree 1. 
 
 
-You can pass ?samples=X as a URL param which will adjust the amount of density samples per ray in the fragment shader. The default is 3, but you can get a pretty good performance increase by decreasing this value, at the cost of a little less accurate rendering.
+You can pass ?samples=X as a URL param which will adjust the amount of density samples per ray in the fragment shader. The default is 8, which gives a more stable result on SH1 scenes; you can get a performance increase by decreasing this value, at the cost of a little less accurate rendering.
 
 ## URL Parameters
 
 The viewer supports a few URL parameters to customize its behavior:
 
-- `?samples=1` - Adjusts the amount of density samples per ray in the fragment shader (default: 3). Lower value increases performance, at a slight cost of rendering accuracy.
+- `?samples=1` - Adjusts the amount of density samples per ray in the fragment shader (default: 8). Lower value increases performance, at a slight cost of rendering accuracy.
 - `?url=https://example.com/myply.ply` - Loads a custom PLY file from the specified URL (default: pumpkin_600k.ply from HuggingFace here: https://huggingface.co/samuelm2/voxel-data/blob/main/pumpkin_600k.ply). For example, I also have a 1.2 million voxel pumpkin ply which you can load with this url: https://vid2scene.com/voxel/?url=https://huggingface.co/samuelm2/voxel-data/resolve/main/pumpkin_1200k.ply
 - `?showLoadingUI=true` - Shows the PLY file upload UI, allowing users to load their own files
+- `?quality=detail` - Uses a sharper density preset and a higher default sample count (`12`) to reduce haze and coherent striping on dense scenes.
+- `?renderScale=1` - Overrides the internal render scale / pixel ratio. Lower values improve FPS; higher values improve sharpness.
 
 ## How to Generate Your Own Scenes
 

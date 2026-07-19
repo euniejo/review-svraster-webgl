@@ -11,6 +11,7 @@ export interface PLYData {
   vertexCount: number;
   sceneCenter: [number, number, number]; // scene center
   sceneExtent: number;      // scene extent as a single value
+  activeShDegree: number;
 }
 
 export class LoadPLY {
@@ -110,6 +111,7 @@ export class LoadPLY {
     // Extract scene center and extent from comments
     let sceneCenter: [number, number, number] = [0, 0, 0];
     let sceneExtent: number = 3.0;
+    let activeShDegree = 1;
     
     for (const line of lines) {
       const trimmed = line.trim();
@@ -132,6 +134,13 @@ export class LoadPLY {
         if (!isNaN(value)) {
           sceneExtent = value;
           console.log(`Found scene extent: ${sceneExtent}`);
+        }
+      }
+      if (trimmed.startsWith('comment active_sh_degree ')) {
+        const value = parseInt(trimmed.substring('comment active_sh_degree '.length).trim(), 10);
+        if (Number.isFinite(value)) {
+          activeShDegree = value;
+          console.log(`Found active SH degree: ${activeShDegree}`);
         }
       }
     }
@@ -338,7 +347,8 @@ export class LoadPLY {
       gridValues,
       vertexCount,
       sceneCenter,
-      sceneExtent
+      sceneExtent,
+      activeShDegree
     };
   }
-} 
+}

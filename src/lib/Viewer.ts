@@ -114,6 +114,44 @@ export class Viewer {
   private touchStartPositions: { [key: number]: { x: number; y: number } } = {};
   private lastTouchDistance: number = 0;
   private isTouchOrbit: boolean = false;
+  private activeShDegree: number = 1;
+  private disableSh2: boolean = false;
+  private sh1BasisOrder: [number, number, number] = [0, 1, 2];
+  private sh2BasisOrder: [number, number, number, number, number] = [0, 1, 2, 3, 4];
+  private useVoxelToCameraShDir: boolean = false;
+  private shComparisonMode: 0 | 1 | 2 = 0;
+  private shDirDiffScale: number = 8.0;
+  private debugRenderMode: 0 | 1 | 2 | 3 | 4 = 0;
+  private stepScale: number = 100.0;
+  private sortingEnabled: boolean = true;
+  private densityMode: 0 | 1 = 0;
+  private densityTransferMode: 0 | 1 | 2 = 0;
+  private densityThreshold: number = 0.0;
+  private blendingEnabled: boolean = true;
+  private depthTestEnabled: boolean = false;
+  private voxelScaleMultiplier: number = 1.0;
+  private rawDensityBias: number = 2.0;
+  private rawDensityScale: number = 0.2;
+
+  private getRestCountForShDegree(): number {
+    if (this.activeShDegree >= 3) {
+      return 45;
+    }
+    if (this.activeShDegree >= 2) {
+      return 24;
+    }
+    return 9;
+  }
+
+  private getShStride(): number {
+    if (this.activeShDegree >= 3) {
+      return 48;
+    }
+    if (this.activeShDegree >= 2) {
+      return 32;
+    }
+    return 12;
+  }
 
   constructor(containerId: string) {
     // Create canvas element
@@ -194,14 +232,26 @@ export class Viewer {
   
   private initWebGLConstants(): void {
     const gl = this.gl!;
-    // Ensure blending is properly set up
-    gl.disable(gl.DEPTH_TEST);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-
-    // Enable backface culling
+    this.applyRenderState();
     gl.enable(gl.CULL_FACE);
     gl.cullFace(gl.BACK);
+  }
+
+  private applyRenderState(): void {
+    const gl = this.gl!;
+    if (this.depthTestEnabled) {
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthFunc(gl.LEQUAL);
+    } else {
+      gl.disable(gl.DEPTH_TEST);
+    }
+
+    if (this.blendingEnabled) {
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    } else {
+      gl.disable(gl.BLEND);
+    }
   }
 
   private detectGPUVendor(): void {
@@ -263,7 +313,7 @@ export class Viewer {
     
     // Updated vertex shader to use texture fetches
     const vsSource = `#version 300 es
-      precision mediump float;
+      precision highp float;
       precision mediump sampler2D;
       
       // Core attributes
@@ -276,6 +326,16 @@ export class Viewer {
       uniform mat4 uSceneTransformMatrix;
       uniform mat4 uInverseTransformMatrix;
       uniform vec3 uCameraPosition;
+      uniform int uShDegree;
+      uniform bool uDisableSh2;
+      uniform bool uUseVoxelToCameraShDir;
+      uniform int uShComparisonMode;
+      uniform float uShDirDiffScale;
+      uniform int uDebugRenderMode;
+      uniform float uVoxelScaleMultiplier;
+      uniform ivec3 uSh1BasisOrder;
+      uniform ivec4 uSh2BasisOrderA;
+      uniform int uSh2BasisOrderB;
 
       // Uniforms for textures
       uniform sampler2D uPosScaleTexture;
@@ -309,8 +369,30 @@ export class Viewer {
         return texture(tex, coord);
       }
 
-      // Modified SH evaluation with proper transform handling
-      vec3 evaluateSH(vec3 sh0, vec3 sh1_0, vec3 sh1_1, vec3 sh1_2, vec3 direction) {
+      float pick3(float a, float b, float c, int idx) {
+        if (idx == 0) return a;
+        if (idx == 1) return b;
+        return c;
+      }
+
+      float pick5(float a, float b, float c, float d, float e, int idx) {
+        if (idx == 0) return a;
+        if (idx == 1) return b;
+        if (idx == 2) return c;
+        if (idx == 3) return d;
+        return e;
+      }
+
+      // SH evaluation up to degree 3
+      vec3 evaluateSH(
+        vec3 sh0,
+        vec3 sh1_0, vec3 sh1_1, vec3 sh1_2,
+        vec3 sh2_0, vec3 sh2_1, vec3 sh2_2, vec3 sh2_3, vec3 sh2_4,
+        vec3 sh3_0, vec3 sh3_1, vec3 sh3_2, vec3 sh3_3, vec3 sh3_4, vec3 sh3_5, vec3 sh3_6,
+        vec3 direction,
+        int degree,
+        bool disableSh2
+      ) {
         // Transform the direction vector using the inverse transform matrix
         // This handles rotations correctly in the shader space
         vec4 transformedDir = uInverseTransformMatrix * vec4(direction, 0.0);
@@ -330,16 +412,72 @@ export class Viewer {
         float basis_z = 0.488603 * dir.z;
         float basis_x = 0.488603 * dir.x;
         
+        float sh1_basis0 = pick3(basis_x, basis_y, basis_z, uSh1BasisOrder.x);
+        float sh1_basis1 = pick3(basis_x, basis_y, basis_z, uSh1BasisOrder.y);
+        float sh1_basis2 = pick3(basis_x, basis_y, basis_z, uSh1BasisOrder.z);
+
         vec3 sh1_contrib = vec3(0);
         // Apply SH1 coefficients per color channel
-        sh1_contrib += sh1_0 * basis_x;
-        sh1_contrib += sh1_1 * basis_y;
-        sh1_contrib += sh1_2 * basis_z;
+        sh1_contrib += sh1_0 * sh1_basis0;
+        sh1_contrib += sh1_1 * sh1_basis1;
+        sh1_contrib += sh1_2 * sh1_basis2;
         
         color += sh1_contrib;
+
+        // SH2 contribution (enabled when uShDegree >= 2)
+        if (degree >= 2 && !disableSh2) {
+          float xx = dir.x * dir.x;
+          float yy = dir.y * dir.y;
+          float zz = dir.z * dir.z;
+          float xy = dir.x * dir.y;
+          float yz = dir.y * dir.z;
+          float xz = dir.x * dir.z;
+
+          float sh2_basis0 =  1.0925484305920792  * xy;
+          float sh2_basis1 =  1.0925484305920792  * yz;
+          float sh2_basis2 =  0.31539156525252005 * (2.0 * zz - xx - yy);
+          float sh2_basis3 =  1.0925484305920792  * xz;
+          float sh2_basis4 =  0.5462742152960396  * (xx - yy);
+
+          color += pick5(sh2_basis0, sh2_basis1, sh2_basis2, sh2_basis3, sh2_basis4, uSh2BasisOrderA.x) * sh2_0;
+          color += pick5(sh2_basis0, sh2_basis1, sh2_basis2, sh2_basis3, sh2_basis4, uSh2BasisOrderA.y) * sh2_1;
+          color += pick5(sh2_basis0, sh2_basis1, sh2_basis2, sh2_basis3, sh2_basis4, uSh2BasisOrderA.z) * sh2_2;
+          color += pick5(sh2_basis0, sh2_basis1, sh2_basis2, sh2_basis3, sh2_basis4, uSh2BasisOrderA.w) * sh2_3;
+          color += pick5(sh2_basis0, sh2_basis1, sh2_basis2, sh2_basis3, sh2_basis4, uSh2BasisOrderB) * sh2_4;
+        }
+
+        if (degree >= 3) {
+          float xx = dir.x * dir.x;
+          float yy = dir.y * dir.y;
+          float zz = dir.z * dir.z;
+
+          float sh3_basis0 = -0.5900435899266435 * dir.y * (3.0 * xx - yy);
+          float sh3_basis1 =  2.890611442640554  * dir.x * dir.y * dir.z;
+          float sh3_basis2 = -0.4570457994644658 * dir.y * (4.0 * zz - xx - yy);
+          float sh3_basis3 =  0.3731763325901154 * dir.z * (2.0 * zz - 3.0 * xx - 3.0 * yy);
+          float sh3_basis4 = -0.4570457994644658 * dir.x * (4.0 * zz - xx - yy);
+          float sh3_basis5 =  1.445305721320277  * dir.z * (xx - yy);
+          float sh3_basis6 = -0.5900435899266435 * dir.x * (xx - 3.0 * yy);
+
+          color += sh3_0 * sh3_basis0;
+          color += sh3_1 * sh3_basis1;
+          color += sh3_2 * sh3_basis2;
+          color += sh3_3 * sh3_basis3;
+          color += sh3_4 * sh3_basis4;
+          color += sh3_5 * sh3_basis5;
+          color += sh3_6 * sh3_basis6;
+        }
+
         color += 0.5;
         
         return max(color, 0.0);
+      }
+
+      vec3 diffHeatmap(vec3 colorA, vec3 colorB) {
+        float diff = clamp(length(colorA - colorB) * uShDirDiffScale, 0.0, 1.0);
+        vec3 warm = mix(vec3(0.1, 0.1, 0.1), vec3(1.0, 0.9, 0.2), min(diff * 2.0, 1.0));
+        vec3 hot = mix(warm, vec3(1.0, 0.2, 0.0), smoothstep(0.5, 1.0, diff));
+        return hot;
       }
       
 
@@ -350,16 +488,41 @@ export class Viewer {
         // Fetch position and scale (1 vec4 per instance)
         vec4 posAndScale = fetch4(uPosScaleTexture, idx, 0, uPosScaleDims, 1);
         vec3 instancePosition = posAndScale.xyz;
-        float instanceScale = posAndScale.w;
+        float instanceScale = posAndScale.w * uVoxelScaleMultiplier;
         
         // Fetch grid values (2 vec4s per instance)
         vec4 gridValues1 = fetch4(uGridValuesTexture, idx, 0, uGridValuesDims, 2);
         vec4 gridValues2 = fetch4(uGridValuesTexture, idx, 1, uGridValuesDims, 2);
         
-        // Fetch SH values (3 vec4s per instance)
-        vec4 sh0_vec4 = fetch4(uShTexture, idx, 0, uShDims, 3);
-        vec4 sh1_part1 = fetch4(uShTexture, idx, 1, uShDims, 3);
-        vec4 sh1_part2 = fetch4(uShTexture, idx, 2, uShDims, 3);
+        // SH1 uses 3 vec4s, SH2 uses 8 vec4s, SH3 uses 12 vec4s
+        int shVec4s = (uShDegree >= 3) ? 12 : ((uShDegree >= 2) ? 8 : 3);
+        vec4 sh0_vec4 = fetch4(uShTexture, idx, 0, uShDims, shVec4s);
+        vec4 sh1_part1 = fetch4(uShTexture, idx, 1, uShDims, shVec4s);
+        vec4 sh1_part2 = fetch4(uShTexture, idx, 2, uShDims, shVec4s);
+
+        vec4 sh2_part1 = vec4(0.0);
+        vec4 sh2_part2 = vec4(0.0);
+        vec4 sh2_part3 = vec4(0.0);
+        vec4 sh2_part4 = vec4(0.0);
+        if (uShDegree >= 2 && !uDisableSh2) {
+          sh2_part1 = fetch4(uShTexture, idx, 3, uShDims, shVec4s);
+          sh2_part2 = fetch4(uShTexture, idx, 4, uShDims, shVec4s);
+          sh2_part3 = fetch4(uShTexture, idx, 5, uShDims, shVec4s);
+          sh2_part4 = fetch4(uShTexture, idx, 6, uShDims, shVec4s);
+        }
+
+        vec4 sh3_part1 = vec4(0.0);
+        vec4 sh3_part2 = vec4(0.0);
+        vec4 sh3_part3 = vec4(0.0);
+        vec4 sh3_part4 = vec4(0.0);
+        vec4 sh3_part5 = vec4(0.0);
+        if (uShDegree >= 3) {
+          sh3_part1 = fetch4(uShTexture, idx, 7, uShDims, shVec4s);
+          sh3_part2 = fetch4(uShTexture, idx, 8, uShDims, shVec4s);
+          sh3_part3 = fetch4(uShTexture, idx, 9, uShDims, shVec4s);
+          sh3_part4 = fetch4(uShTexture, idx, 10, uShDims, shVec4s);
+          sh3_part5 = fetch4(uShTexture, idx, 11, uShDims, shVec4s);
+        }
         
         // Extract SH0 (rgb only - first 3 components)
         vec3 sh0 = sh0_vec4.rgb;
@@ -369,6 +532,20 @@ export class Viewer {
         vec3 sh1_0 = vec3(sh0_vec4.a, sh1_part1.xy);
         vec3 sh1_1 = vec3(sh1_part1.zw, sh1_part2.x);
         vec3 sh1_2 = sh1_part2.yzw;
+
+        // Extract SH2 values (f_rest_9..f_rest_23)
+        vec3 sh2_0 = sh2_part1.xyz;
+        vec3 sh2_1 = vec3(sh2_part1.w, sh2_part2.xy);
+        vec3 sh2_2 = vec3(sh2_part2.zw, sh2_part3.x);
+        vec3 sh2_3 = sh2_part3.yzw;
+        vec3 sh2_4 = sh2_part4.xyz;
+        vec3 sh3_0 = vec3(sh2_part4.w, sh3_part1.xy);
+        vec3 sh3_1 = vec3(sh3_part1.zw, sh3_part2.x);
+        vec3 sh3_2 = sh3_part2.yzw;
+        vec3 sh3_3 = sh3_part3.xyz;
+        vec3 sh3_4 = vec3(sh3_part3.w, sh3_part4.xy);
+        vec3 sh3_5 = vec3(sh3_part4.zw, sh3_part5.x);
+        vec3 sh3_6 = sh3_part5.yzw;
     
         // Scale the vertex position for this instance
         vec3 scaledVertexPos = aVertexPosition.xyz * instanceScale;
@@ -391,11 +568,32 @@ export class Viewer {
         // Pass scale to fragment shader
         vScale = instanceScale;
         
-        // Calculate viewing direction from voxel center to camera in world space
-        vec3 viewDir = normalize(vVoxelCenter - uCameraPosition);
-        
-        // Calculate color using SH and pass to fragment shader
-        vColor = evaluateSH(sh0, sh1_0, sh1_1, sh1_2, viewDir);
+        vec3 cameraToVoxelDir = normalize(vVoxelCenter - uCameraPosition);
+        vec3 voxelToCameraDir = normalize(uCameraPosition - vVoxelCenter);
+        vec3 cameraToVoxelColor = evaluateSH(
+          sh0, sh1_0, sh1_1, sh1_2, sh2_0, sh2_1, sh2_2, sh2_3, sh2_4,
+          sh3_0, sh3_1, sh3_2, sh3_3, sh3_4, sh3_5, sh3_6, cameraToVoxelDir, uShDegree, uDisableSh2
+        );
+        vec3 voxelToCameraColor = evaluateSH(
+          sh0, sh1_0, sh1_1, sh1_2, sh2_0, sh2_1, sh2_2, sh2_3, sh2_4,
+          sh3_0, sh3_1, sh3_2, sh3_3, sh3_4, sh3_5, sh3_6, voxelToCameraDir, uShDegree, uDisableSh2
+        );
+        vec3 sh1Color = evaluateSH(
+          sh0, sh1_0, sh1_1, sh1_2, sh2_0, sh2_1, sh2_2, sh2_3, sh2_4,
+          sh3_0, sh3_1, sh3_2, sh3_3, sh3_4, sh3_5, sh3_6, cameraToVoxelDir, 1, true
+        );
+        vec3 sh3Color = evaluateSH(
+          sh0, sh1_0, sh1_1, sh1_2, sh2_0, sh2_1, sh2_2, sh2_3, sh2_4,
+          sh3_0, sh3_1, sh3_2, sh3_3, sh3_4, sh3_5, sh3_6, cameraToVoxelDir, 3, false
+        );
+
+        if (uShComparisonMode == 1) {
+          vColor = diffHeatmap(cameraToVoxelColor, voxelToCameraColor);
+        } else if (uShComparisonMode == 2) {
+          vColor = diffHeatmap(sh1Color, sh3Color);
+        } else {
+          vColor = uUseVoxelToCameraShDir ? voxelToCameraColor : cameraToVoxelColor;
+        }
         
         // Pass density values to fragment shader
         vDensity0 = gridValues1;
@@ -405,7 +603,7 @@ export class Viewer {
     
     // Updated fragment shader with sampling loop
     const fsSource = `#version 300 es
-      precision mediump float;
+      precision highp float;
       
       // Define the sample count as a constant
       const int SAMPLE_COUNT = ${sampleCount};
@@ -421,6 +619,13 @@ export class Viewer {
       uniform mat4 uViewMatrix;
       uniform mat4 uInverseTransformMatrix;
       uniform vec3 uTransformFlips; // x, y, z components will be -1 for flipped axes, 1 for unchanged
+      uniform int uDebugRenderMode;
+      uniform float uStepScale;
+      uniform int uDensityMode;
+      uniform int uDensityTransferMode;
+      uniform float uDensityThreshold;
+      uniform float uRawDensityBias;
+      uniform float uRawDensityScale;
       
       out vec4 fragColor;
       
@@ -515,6 +720,13 @@ export class Viewer {
         
         return fz1 * c0 + fz * c1;
       }
+
+      float flatDensity(vec4 density0, vec4 density1) {
+        return (
+          density0.x + density0.y + density0.z + density0.w +
+          density1.x + density1.y + density1.z + density1.w
+        ) / 8.0;
+      }
       
       float explin(float x) {
         float threshold = 1.1;
@@ -524,6 +736,23 @@ export class Viewer {
           float ln1_1 = 0.0953101798043; // pre-computed ln(1.1)
           return exp((x / threshold) - 1.0 + ln1_1);
         }
+      }
+
+      float mapDensity(float rawDensity) {
+        float shiftedDensity = rawDensity - uDensityThreshold;
+        if (uDensityTransferMode == 1) {
+          return max(shiftedDensity, 0.0);
+        }
+        if (uDensityTransferMode == 2) {
+          return exp(clamp(shiftedDensity, -20.0, 10.0));
+        }
+        return explin(shiftedDensity);
+      }
+
+      float hash13(vec3 p) {
+        p = fract(p * 0.1031);
+        p += dot(p, p.yzx + 33.33);
+        return fract((p.x + p.y) * p.z);
       }
       
       void main() {
@@ -537,6 +766,11 @@ export class Viewer {
         float tFar = min(tIntersect.y, 1000.0);
         
         if (tNear < tFar) {
+          if (uDebugRenderMode == 3) {
+            fragColor = vec4(1.0, 1.0, 1.0, 1.0);
+            return;
+          }
+
           // Calculate box min and max
           vec3 boxMin = vVoxelCenter - vec3(vScale * 0.5);
           vec3 boxMax = vVoxelCenter + vec3(vScale * 0.5);
@@ -555,30 +789,49 @@ export class Viewer {
           
           // Use a loop to calculate total density
           float totalDensity = 0.0;
-          
-          // Apply explin after interpolation
-          // The CUDA reference has a 100x scale factor
-          const float STEP_SCALE = 100.0;
+          float rawDensityAccum = 0.0;
+          float baseJitter = hash13(entryPoint * 19.19 + vVoxelCenter * 7.13);
           
           for (int i = 0; i < SAMPLE_COUNT; i++) {
-            // Calculate sample position - evenly distribute samples
-            float t = tNear + (tFar - tNear) * (float(i) + 0.5) / float(SAMPLE_COUNT);
+            // Jitter each stratum slightly to break up coherent banding on thin geometry.
+            float sampleJitter = fract(baseJitter + float(i) * 0.61803398875);
+            float t = tNear + (tFar - tNear) * (float(i) + sampleJitter) / float(SAMPLE_COUNT);
             vec3 samplePoint = rayOrigin + rayDir * t;
             
             // Get density at sample point
-            float rawDensity = trilinearInterpolation(samplePoint, boxMin, boxMax, vDensity0, vDensity1);
+            float rawDensity = (uDensityMode == 1)
+              ? flatDensity(vDensity0, vDensity1)
+              : trilinearInterpolation(samplePoint, boxMin, boxMax, vDensity0, vDensity1);
+            rawDensityAccum += rawDensity;
             
-            // Apply explin and accumulate
-            float density = STEP_SCALE * stepLength * explin(rawDensity);
+            // Apply selected density transfer and accumulate
+            float density = uStepScale * stepLength * mapDensity(rawDensity);
             totalDensity += density;
+          }
+
+          if (uDebugRenderMode == 4) {
+            float avgRawDensity = rawDensityAccum / float(SAMPLE_COUNT);
+            float rawVis = clamp((avgRawDensity + uRawDensityBias) * uRawDensityScale, 0.0, 1.0);
+            fragColor = vec4(vec3(rawVis), 1.0);
+            return;
           }
           
           // Use view space ray length for Beer-Lambert law
           float alpha = 1.0 - exp(-totalDensity);
-          
-          // Premultiply the color by alpha
-          vec3 premultipliedColor = vColor * alpha;
-          fragColor = vec4(premultipliedColor, alpha);
+
+          if (uDebugRenderMode == 1) {
+            // Keep premultiplied-alpha semantics in debug mode too.
+            // The previous opaque output exaggerated frontmost voxel faces.
+            fragColor = vec4(vec3(alpha * alpha), alpha);
+          } else if (uDebugRenderMode == 2) {
+            float thickness = max(0.0, tFar - tNear);
+            float thicknessVis = clamp(thickness / max(vScale, 1e-5), 0.0, 1.0);
+            fragColor = vec4(vec3(thicknessVis), 1.0);
+          } else {
+            // Premultiply the color by alpha
+            vec3 premultipliedColor = vColor * alpha;
+            fragColor = vec4(premultipliedColor, alpha);
+          }
         } else {
           discard;
         }
@@ -812,7 +1065,7 @@ export class Viewer {
       vec3.fromValues(cameraPos[0], cameraPos[1], cameraPos[2])
     );
 
-    if (cameraMoveDistance > this.resortThreshold && !this.pendingSortRequest) {
+    if (this.sortingEnabled && cameraMoveDistance > this.resortThreshold && !this.pendingSortRequest) {
       // Update lastCameraPosition with current position
       vec3.set(this.lastCameraPosition, cameraPos[0], cameraPos[1], cameraPos[2]);
       this.requestSort();
@@ -826,7 +1079,13 @@ export class Viewer {
     // Clear the canvas with a slightly visible color to see if rendering is happening
     // gl.clearColor(1.0 / 255.0, 121.0 / 255.0, 51.0 / 255.0, 1.0); 
     gl.clearColor(0.0, 0.0, 0.0, 1.0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    this.applyRenderState();
+    if (this.depthTestEnabled) {
+      gl.clearDepth(1.0);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    } else {
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    }
 
     // Use our shader program
     gl.useProgram(this.program);
@@ -866,6 +1125,66 @@ export class Viewer {
     
     // Pass camera position to the shader
     gl.uniform3f(cameraPositionLocation, cameraPos[0], cameraPos[1], cameraPos[2]);
+    gl.uniform1i(gl.getUniformLocation(this.program, 'uShDegree'), this.activeShDegree);
+    gl.uniform1i(gl.getUniformLocation(this.program, 'uDisableSh2'), this.disableSh2 ? 1 : 0);
+    gl.uniform1i(
+      gl.getUniformLocation(this.program, 'uUseVoxelToCameraShDir'),
+      this.useVoxelToCameraShDir ? 1 : 0
+    );
+    gl.uniform1i(
+      gl.getUniformLocation(this.program, 'uShComparisonMode'),
+      this.shComparisonMode
+    );
+    gl.uniform1f(
+      gl.getUniformLocation(this.program, 'uShDirDiffScale'),
+      this.shDirDiffScale
+    );
+    gl.uniform1i(
+      gl.getUniformLocation(this.program, 'uDebugRenderMode'),
+      this.debugRenderMode
+    );
+    gl.uniform1f(
+      gl.getUniformLocation(this.program, 'uVoxelScaleMultiplier'),
+      this.voxelScaleMultiplier
+    );
+    gl.uniform1f(
+      gl.getUniformLocation(this.program, 'uStepScale'),
+      this.stepScale
+    );
+    gl.uniform1i(
+      gl.getUniformLocation(this.program, 'uDensityMode'),
+      this.densityMode
+    );
+    gl.uniform1i(
+      gl.getUniformLocation(this.program, 'uDensityTransferMode'),
+      this.densityTransferMode
+    );
+    gl.uniform1f(
+      gl.getUniformLocation(this.program, 'uDensityThreshold'),
+      this.densityThreshold
+    );
+    gl.uniform1f(
+      gl.getUniformLocation(this.program, 'uRawDensityBias'),
+      this.rawDensityBias
+    );
+    gl.uniform1f(
+      gl.getUniformLocation(this.program, 'uRawDensityScale'),
+      this.rawDensityScale
+    );
+    gl.uniform3i(
+      gl.getUniformLocation(this.program, 'uSh1BasisOrder'),
+      this.sh1BasisOrder[0],
+      this.sh1BasisOrder[1],
+      this.sh1BasisOrder[2]
+    );
+    gl.uniform4i(
+      gl.getUniformLocation(this.program, 'uSh2BasisOrderA'),
+      this.sh2BasisOrder[0],
+      this.sh2BasisOrder[1],
+      this.sh2BasisOrder[2],
+      this.sh2BasisOrder[3]
+    );
+    gl.uniform1i(gl.getUniformLocation(this.program, 'uSh2BasisOrderB'), this.sh2BasisOrder[4]);
     
     // Set texture uniforms
     const textureWidthLocation = gl.getUniformLocation(this.program, 'uTextureWidth');
@@ -945,32 +1264,32 @@ export class Viewer {
     
     // Extract SH1 coefficients from shRestValues if provided
     if (shRestValues && shRestValues.length > 0) {
-      // Each vertex has multiple rest values, we need to extract 9 values for SH1
+      // Each vertex has multiple rest values. Keep SH1 only in sh=1 mode, SH1+SH2 in sh=2 mode.
       const restPerVertex = shRestValues.length / positions.length * 3;
-      console.log(`Found ${restPerVertex} rest values per vertex, extracting SH1 (9 values per vertex)`);
+      const restCount = this.getRestCountForShDegree();
+      console.log(`Found ${restPerVertex} rest values per vertex, extracting ${restCount} values per vertex`);
       
-      // We need space for 9 values per vertex
-      this.originalSH1Values = new Float32Array(positions.length / 3 * 9);
+      // Allocate exactly what current SH mode needs to preserve original SH1 path
+      this.originalSH1Values = new Float32Array(positions.length / 3 * restCount);
       
       for (let i = 0; i < positions.length / 3; i++) {
-        // Extract 9 values from shRestValues for each vertex
-        for (let j = 0; j < 9; j++) {
+        for (let j = 0; j < restCount; j++) {
           // Only extract if we have enough values
           if (j < restPerVertex) {
-            this.originalSH1Values[i * 9 + j] = shRestValues[i * restPerVertex + j];
+            this.originalSH1Values[i * restCount + j] = shRestValues[i * restPerVertex + j];
           } else {
             // If not enough rest values, set to 0
-            this.originalSH1Values[i * 9 + j] = 0.0;
+            this.originalSH1Values[i * restCount + j] = 0.0;
           }
         }
       }
       
-      console.log(`Extracted ${this.originalSH1Values.length / 9} SH1 sets with 9 values each`);
+      console.log(`Extracted ${this.originalSH1Values.length / restCount} SH sets with ${restCount} values each`);
       console.log('SH1 sample values (first vertex):', 
                 this.originalSH1Values.slice(0, 9));
     } else {
       // If no rest values provided, use zeros (no directional lighting)
-      this.originalSH1Values = new Float32Array(positions.length / 3 * 9);
+      this.originalSH1Values = new Float32Array(positions.length / 3 * this.getRestCountForShDegree());
       console.log('No SH1 values provided, using default (no directional lighting)');
     }
     
@@ -1075,6 +1394,146 @@ export class Viewer {
    */
   public setCameraTarget(x: number, y: number, z: number): void {
     this.camera.setTarget(x, y, z);
+  }
+
+  public setShDegree(degree: number): void {
+    this.activeShDegree = Math.max(1, Math.min(3, Math.floor(degree)));
+  }
+
+  public setDisableSh2(disable: boolean): void {
+    this.disableSh2 = disable;
+  }
+
+  public setUseVoxelToCameraShDir(useVoxelToCamera: boolean): void {
+    this.useVoxelToCameraShDir = useVoxelToCamera;
+  }
+
+  public setShowShDirDiff(showDiff: boolean): void {
+    this.shComparisonMode = showDiff ? 1 : 0;
+  }
+
+  public setShComparisonMode(mode: 'normal' | 'dirdiff' | 'degdiff13'): void {
+    if (mode === 'dirdiff') {
+      this.shComparisonMode = 1;
+    } else if (mode === 'degdiff13') {
+      this.shComparisonMode = 2;
+    } else {
+      this.shComparisonMode = 0;
+    }
+  }
+
+  public setShDirDiffScale(scale: number): void {
+    if (!Number.isFinite(scale)) {
+      return;
+    }
+    this.shDirDiffScale = Math.max(0.1, scale);
+  }
+
+  public setDebugRenderMode(mode: 'normal' | 'alpha' | 'thickness' | 'solid' | 'rawdensity'): void {
+    if (mode === 'alpha') {
+      this.debugRenderMode = 1;
+    } else if (mode === 'thickness') {
+      this.debugRenderMode = 2;
+    } else if (mode === 'solid') {
+      this.debugRenderMode = 3;
+    } else if (mode === 'rawdensity') {
+      this.debugRenderMode = 4;
+    } else {
+      this.debugRenderMode = 0;
+    }
+  }
+
+  public setStepScale(scale: number): void {
+    if (!Number.isFinite(scale)) {
+      return;
+    }
+    this.stepScale = Math.max(0.01, scale);
+  }
+
+  public setSortingEnabled(enabled: boolean): void {
+    this.sortingEnabled = enabled;
+  }
+
+  public setDensityMode(mode: 'trilinear' | 'flat'): void {
+    this.densityMode = mode === 'flat' ? 1 : 0;
+  }
+
+  public setDensityTransferMode(mode: 'explin' | 'linear' | 'exp'): void {
+    if (mode === 'linear') {
+      this.densityTransferMode = 1;
+    } else if (mode === 'exp') {
+      this.densityTransferMode = 2;
+    } else {
+      this.densityTransferMode = 0;
+    }
+  }
+
+  public setDensityThreshold(threshold: number): void {
+    if (!Number.isFinite(threshold)) {
+      return;
+    }
+    this.densityThreshold = threshold;
+  }
+
+  public setBlendingEnabled(enabled: boolean): void {
+    this.blendingEnabled = enabled;
+  }
+
+  public setDepthTestEnabled(enabled: boolean): void {
+    this.depthTestEnabled = enabled;
+  }
+
+  public setVoxelScaleMultiplier(multiplier: number): void {
+    if (!Number.isFinite(multiplier)) {
+      return;
+    }
+    this.voxelScaleMultiplier = Math.max(0.01, multiplier);
+  }
+
+  public setRawDensityBias(bias: number): void {
+    if (!Number.isFinite(bias)) {
+      return;
+    }
+    this.rawDensityBias = bias;
+  }
+
+  public setRawDensityScale(scale: number): void {
+    if (!Number.isFinite(scale)) {
+      return;
+    }
+    this.rawDensityScale = Math.max(0.001, scale);
+  }
+
+  public setRenderScale(scale: number): void {
+    if (!Number.isFinite(scale)) {
+      return;
+    }
+    this.customPixelRatio = Math.max(0.25, Math.min(scale, 2.0));
+    this.updateCanvasSize();
+  }
+
+  public setSh1BasisOrder(order: number[]): void {
+    if (order.length !== 3) {
+      return;
+    }
+    this.sh1BasisOrder = [
+      Math.max(0, Math.min(2, Math.floor(order[0]))),
+      Math.max(0, Math.min(2, Math.floor(order[1]))),
+      Math.max(0, Math.min(2, Math.floor(order[2])))
+    ];
+  }
+
+  public setSh2BasisOrder(order: number[]): void {
+    if (order.length !== 5) {
+      return;
+    }
+    this.sh2BasisOrder = [
+      Math.max(0, Math.min(4, Math.floor(order[0]))),
+      Math.max(0, Math.min(4, Math.floor(order[1]))),
+      Math.max(0, Math.min(4, Math.floor(order[2]))),
+      Math.max(0, Math.min(4, Math.floor(order[3]))),
+      Math.max(0, Math.min(4, Math.floor(order[4])))
+    ];
   }
   
   /**
@@ -1237,7 +1696,7 @@ export class Viewer {
    * Request voxel sorting based on current camera position
    */
   private requestSort(): void {
-    if (!this.sortWorker || this.pendingSortRequest || this.instanceCount === 0 || !this.originalPositions) {
+    if (!this.sortingEnabled || !this.sortWorker || this.pendingSortRequest || this.instanceCount === 0 || !this.originalPositions) {
       return;
     }
     
@@ -1559,15 +2018,13 @@ export class Viewer {
   ): WebGLTexture | null {
     const gl = this.gl!;
     
-    // Calculate dimensions that won't exceed hardware limits
+    // Pack by actual RGBA texels so width always respects MAX_TEXTURE_SIZE.
+    const vec4sPerElement = Math.max(1, Math.ceil(componentsPerElement / 4));
     const numElements = data.length / componentsPerElement;
-    const maxTextureSize = Math.min(4096, gl.getParameter(gl.MAX_TEXTURE_SIZE));
-    const width = Math.min(maxTextureSize, Math.ceil(Math.sqrt(numElements)));
-    const height = Math.ceil(numElements / width);
-    
-    // Store dimensions based on texture type
-    const paddedWidth = Math.ceil(width * componentsPerElement / 4) * 4;
-    const finalWidth = paddedWidth / 4;
+    const totalTexels = numElements * vec4sPerElement;
+    const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    const finalWidth = Math.min(maxTextureSize, Math.ceil(Math.sqrt(totalTexels)));
+    const height = Math.ceil(totalTexels / finalWidth);
     
     switch (textureType) {
       case TextureType.MainAttributes:
@@ -1590,9 +2047,9 @@ export class Viewer {
     // Create and set up texture
     const texture = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, texture);
-    
-    // Create padded data array
-    const paddedData = new Float32Array(paddedWidth * height);
+
+    // Create padded data array (RGBA float per texel)
+    const paddedData = new Float32Array(finalWidth * height * 4);
     paddedData.set(data);
     
     // Upload data to texture
@@ -1661,20 +2118,22 @@ export class Viewer {
       gridValuesData[i * 8 + 7] = this.originalGridValues2[i * 4 + 3];
     }
     
-    // 3. Create SH0 + SH1 texture (3+9=12 values per instance = 3 vec4s)
-    const shData = new Float32Array(this.instanceCount * 12);
+    const activeRestCount = this.getRestCountForShDegree();
+    // SH1 path keeps original layout (12 floats = 3 vec4s), SH2 uses 8 vec4s, SH3 uses 12 vec4s.
+    const shStride = this.getShStride();
+    const shData = new Float32Array(this.instanceCount * shStride);
     for (let i = 0; i < this.instanceCount; i++) {
       // SH0 (rgb) - first 3 values
-      shData[i * 12 + 0] = this.originalSH0Values[i * 3 + 0]; // R
-      shData[i * 12 + 1] = this.originalSH0Values[i * 3 + 1]; // G
-      shData[i * 12 + 2] = this.originalSH0Values[i * 3 + 2]; // B
+      shData[i * shStride + 0] = this.originalSH0Values[i * 3 + 0]; // R
+      shData[i * shStride + 1] = this.originalSH0Values[i * 3 + 1]; // G
+      shData[i * shStride + 2] = this.originalSH0Values[i * 3 + 2]; // B
       
-      // SH1 (all 9 values) - starting from the 4th position
-      for (let j = 0; j < 9; j++) {
+      // SH rest (SH1, SH2 depending on activeShDegree)
+      for (let j = 0; j < activeRestCount; j++) {
         if (j < this.originalSH1Values.length / this.instanceCount) {
-          shData[i * 12 + 3 + j] = this.originalSH1Values[i * 9 + j];
+          shData[i * shStride + 3 + j] = this.originalSH1Values[i * activeRestCount + j];
         } else {
-          shData[i * 12 + 3 + j] = 0.0;
+          shData[i * shStride + 3 + j] = 0.0;
         }
       }
     }
@@ -1694,7 +2153,7 @@ export class Viewer {
     
     this.shTexture = this.createDataTexture(
       shData, 
-      12, // 12 components per element (3 vec4s)
+      shStride, // 12 for SH1 path, 32 for SH2 path
       TextureType.ShCoefficients
     );
   }
@@ -1885,7 +2344,11 @@ export class Viewer {
 
   private getSampleCountFromURL(): number {
     const urlParams = new URLSearchParams(window.location.search);
-    const sampleCount = parseInt(urlParams.get('samples') || '3', 10);
+    const quality = (urlParams.get('quality') || '').toLowerCase();
+    // A slightly higher default reduces visible striping/shimmer in SH1 mode
+    // while preserving the existing `?samples=` escape hatch for performance.
+    const fallbackSamples = quality === 'detail' ? '12' : quality === 'preview' ? '4' : '8';
+    const sampleCount = parseInt(urlParams.get('samples') || fallbackSamples, 10);
     // Ensure the count is at least 1 and not too high for performance
     return Math.max(1, Math.min(sampleCount, 64));
   }
