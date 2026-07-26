@@ -666,7 +666,7 @@ function addLocalPlyLoader(
       return;
     }
     selectedFile = file;
-    status.textContent = `${file.name} selected. Loading both panes locally...`;
+    status.textContent = 'Loading both panes locally...';
     status.title = status.textContent;
     sendFile(leftFrame);
     sendFile(rightFrame);

@@ -31,7 +31,7 @@ body {
 }
 
 body.compare-shell {
-  --compare-toolbar-height: 68px;
+  --compare-toolbar-height: 112px;
   display: block;
   overflow: hidden;
   background: #050505;
@@ -42,9 +42,14 @@ body.compare-shell {
   inset: 0 0 auto;
   z-index: 20;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(240px, 1fr);
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 320px);
+  grid-template-rows: 44px 40px;
+  grid-template-areas:
+    'local local'
+    'guide preset';
   align-items: center;
-  gap: 16px;
+  column-gap: 16px;
+  row-gap: 8px;
   height: var(--compare-toolbar-height);
   padding: 10px 14px;
   box-sizing: border-box;
@@ -62,10 +67,15 @@ body.compare-shell {
 }
 
 .local-ply-loader {
+  grid-area: local;
   display: flex;
   align-items: center;
   min-width: 0;
+  height: 100%;
   gap: 8px;
+  padding-bottom: 7px;
+  box-sizing: border-box;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
   font-size: 13px;
   white-space: nowrap;
 }
@@ -90,7 +100,8 @@ body.compare-shell {
 }
 
 .compare-header {
-  justify-self: center;
+  grid-area: guide;
+  justify-self: start;
   padding: 7px 12px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 999px;
@@ -103,6 +114,7 @@ body.compare-shell {
 }
 
 .compare-preset-panel {
+  grid-area: preset;
   justify-self: end;
   width: min(100%, 280px);
   min-width: 0;
@@ -130,12 +142,15 @@ body.compare-shell {
 
 @media (max-width: 700px) {
   body.compare-shell {
-    --compare-toolbar-height: 112px;
+    --compare-toolbar-height: 124px;
   }
 
   .compare-toolbar {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: repeat(2, minmax(0, 1fr));
+    grid-template-rows: 52px 48px;
+    grid-template-areas:
+      'local'
+      'preset';
     gap: 8px;
     padding: 8px 10px;
   }
