@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:sh": "node --test tests/sh-reference.test.ts",
+    "test:sort": "node --test tests/sorting.test.ts",
     "preview": "vite preview"
   },
   "devDependencies": {

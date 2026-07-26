@@ -75,6 +75,9 @@ The viewer supports a few URL parameters to customize its behavior:
 - `?showLoadingUI=true` - Shows the PLY file upload UI, allowing users to load their own files
 - `?quality=detail` - Uses a sharper density preset and a higher default sample count (`12`) to reduce haze and coherent striping on dense scenes.
 - `?renderScale=1` - Overrides the internal render scale / pixel ratio. Lower values improve FPS; higher values improve sharpness.
+- `?compositeMode=front` - Uses global front-to-back transmittance blending with the selected sort mode.
+- `?sortMode=morton` - Uses reconstructed or stored 48-bit SVRaster Morton ranks and enables front-to-back blending by default.
+- `?rasterAA=on` - Restores browser MSAA for proxy cube edges. It is disabled by default to avoid partial-coverage cracks.
 
 ## How to Generate Your Own Scenes
 
@@ -90,6 +93,9 @@ If you have your own SVRaster scenes that you'd like to visualize in this WebGL 
    ```bash
    python scripts/convert_to_ply.py outputs/pumpkin/model.pt outputs/pumpkin/pumpkin.ply
    ```
+   New PLY files store the 48-bit octree path as `octpath_low` and `octpath_high`.
+   Legacy files with a truncated `octpath` remain loadable; Morton mode reconstructs
+   the complete path from voxel centers and octree levels.
 
 3. Open the WebGL viewer and use the URL parameter or file upload UI to load your custom PLY file
 

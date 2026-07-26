@@ -4,6 +4,8 @@
  */
 import { Camera } from './Camera';
 import { mat4, vec3 } from 'gl-matrix';
+import { getRequiredShRestCount, SVRASTER_SH_EVALUATION_GLSL } from './SphericalHarmonics';
+import { MortonSorter } from './MortonSorter';
 
 enum TextureType {
   MainAttributes,
@@ -31,6 +33,8 @@ export class Viewer {
   // Scene properties for scaling calculation
 
   private baseVoxelSize: number = 0.01;
+  private sceneCenter: [number, number, number] = [0, 0, 0];
+  private sceneExtent: number = 1;
   
   private lastCameraPosition: vec3 = vec3.create();
   private resortThreshold: number = 0.1; // Threshold for camera movement to trigger resort
@@ -43,12 +47,9 @@ export class Viewer {
   private originalScales: Float32Array | null = null;
   private originalGridValues1: Float32Array | null = null;
   private originalGridValues2: Float32Array | null = null;
+  private originalOctpathLow: Uint32Array | null = null;
+  private originalOctpathHigh: Uint32Array | null = null;
   private sortedIndices: Uint32Array | null = null;
-  
-  // Add these properties to store the original octree data
-  private originalOctlevels: Uint8Array | null = null;
-  private originalOctpaths: Uint32Array | null = null;
-  
   
   // Add these properties to the Viewer class definition at the top
   private isDragging: boolean = false;
@@ -121,26 +122,29 @@ export class Viewer {
   private useVoxelToCameraShDir: boolean = false;
   private shComparisonMode: 0 | 1 | 2 = 0;
   private shDirDiffScale: number = 8.0;
-  private debugRenderMode: 0 | 1 | 2 | 3 | 4 = 0;
+  private debugRenderMode: 0 | 1 | 2 | 3 | 4 | 5 = 0;
   private stepScale: number = 100.0;
   private sortingEnabled: boolean = true;
+  private sortMetric: 'distance' | 'depth' | 'morton' = 'depth';
+  private compositeMode: 'back' | 'front' = 'back';
   private densityMode: 0 | 1 = 0;
   private densityTransferMode: 0 | 1 | 2 = 0;
   private densityThreshold: number = 0.0;
   private blendingEnabled: boolean = true;
   private depthTestEnabled: boolean = false;
+  private cullingEnabled: boolean = true;
   private voxelScaleMultiplier: number = 1.0;
   private rawDensityBias: number = 2.0;
   private rawDensityScale: number = 0.2;
+  private minVisibleOctlevel: number = 0;
+  private maxVisibleOctlevel: number = 16;
+  private minGridMean: number = -1000.0;
+  private exactRayMode: boolean = true;
+  private referenceIntegration: boolean = true;
+  private rasterSampleCount: number = 0;
 
   private getRestCountForShDegree(): number {
-    if (this.activeShDegree >= 3) {
-      return 45;
-    }
-    if (this.activeShDegree >= 2) {
-      return 24;
-    }
-    return 9;
+    return getRequiredShRestCount(this.activeShDegree);
   }
 
   private getShStride(): number {
@@ -171,11 +175,20 @@ export class Viewer {
     // Append to container
     this.container.appendChild(this.canvas);
     
-    // Initialize WebGL2 context
-    this.gl = this.canvas.getContext('webgl2');
+    // Proxy cube edges must not receive partial MSAA coverage. The fragment
+    // shader computes the actual voxel ray integral for every covered pixel.
+    const rasterAaEnabled =
+      new URLSearchParams(window.location.search).get('rasterAA')?.toLowerCase() === 'on';
+    this.gl = this.canvas.getContext('webgl2', {
+      antialias: rasterAaEnabled,
+      alpha: true,
+      premultipliedAlpha: true
+    });
     if (!this.gl) {
       throw new Error('WebGL2 not supported in this browser');
     }
+    this.rasterSampleCount = this.gl.getParameter(this.gl.SAMPLES) as number;
+    console.log(`Raster MSAA samples: ${this.rasterSampleCount}`);
     
     if (!this.gl.getExtension('EXT_color_buffer_float')) {
       console.error('EXT_color_buffer_float extension not supported');
@@ -231,10 +244,7 @@ export class Viewer {
   }
   
   private initWebGLConstants(): void {
-    const gl = this.gl!;
     this.applyRenderState();
-    gl.enable(gl.CULL_FACE);
-    gl.cullFace(gl.BACK);
   }
 
   private applyRenderState(): void {
@@ -248,9 +258,25 @@ export class Viewer {
 
     if (this.blendingEnabled) {
       gl.enable(gl.BLEND);
-      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      if (this.compositeMode === 'front') {
+        gl.blendFuncSeparate(
+          gl.ONE_MINUS_DST_ALPHA,
+          gl.ONE,
+          gl.ONE_MINUS_DST_ALPHA,
+          gl.ONE
+        );
+      } else {
+        gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      }
     } else {
       gl.disable(gl.BLEND);
+    }
+
+    if (this.cullingEnabled) {
+      gl.enable(gl.CULL_FACE);
+      gl.cullFace(gl.BACK);
+    } else {
+      gl.disable(gl.CULL_FACE);
     }
   }
 
@@ -333,6 +359,10 @@ export class Viewer {
       uniform float uShDirDiffScale;
       uniform int uDebugRenderMode;
       uniform float uVoxelScaleMultiplier;
+      uniform float uBaseVoxelSize;
+      uniform int uMinVisibleOctlevel;
+      uniform int uMaxVisibleOctlevel;
+      uniform float uMinGridMean;
       uniform ivec3 uSh1BasisOrder;
       uniform ivec4 uSh2BasisOrderA;
       uniform int uSh2BasisOrderB;
@@ -383,95 +413,7 @@ export class Viewer {
         return e;
       }
 
-      // SH evaluation up to degree 3
-      vec3 evaluateSH(
-        vec3 sh0,
-        vec3 sh1_0, vec3 sh1_1, vec3 sh1_2,
-        vec3 sh2_0, vec3 sh2_1, vec3 sh2_2, vec3 sh2_3, vec3 sh2_4,
-        vec3 sh3_0, vec3 sh3_1, vec3 sh3_2, vec3 sh3_3, vec3 sh3_4, vec3 sh3_5, vec3 sh3_6,
-        vec3 direction,
-        int degree,
-        bool disableSh2
-      ) {
-        // Transform the direction vector using the inverse transform matrix
-        // This handles rotations correctly in the shader space
-        vec4 transformedDir = uInverseTransformMatrix * vec4(direction, 0.0);
-        
-        // Normalize the transformed direction
-        vec3 dir = normalize(transformedDir.xyz);
-        
-        // Rest of the SH evaluation remains the same
-        // SH0
-        vec3 color = sh0 * 0.28209479177387814;
-        
-        // Calculate basis functions for SH1 (first order terms only)
-        // Y_1,-1 = 0.488603 * y
-        // Y_1,0  = 0.488603 * z
-        // Y_1,1  = 0.488603 * x
-        float basis_y = 0.488603 * dir.y;
-        float basis_z = 0.488603 * dir.z;
-        float basis_x = 0.488603 * dir.x;
-        
-        float sh1_basis0 = pick3(basis_x, basis_y, basis_z, uSh1BasisOrder.x);
-        float sh1_basis1 = pick3(basis_x, basis_y, basis_z, uSh1BasisOrder.y);
-        float sh1_basis2 = pick3(basis_x, basis_y, basis_z, uSh1BasisOrder.z);
-
-        vec3 sh1_contrib = vec3(0);
-        // Apply SH1 coefficients per color channel
-        sh1_contrib += sh1_0 * sh1_basis0;
-        sh1_contrib += sh1_1 * sh1_basis1;
-        sh1_contrib += sh1_2 * sh1_basis2;
-        
-        color += sh1_contrib;
-
-        // SH2 contribution (enabled when uShDegree >= 2)
-        if (degree >= 2 && !disableSh2) {
-          float xx = dir.x * dir.x;
-          float yy = dir.y * dir.y;
-          float zz = dir.z * dir.z;
-          float xy = dir.x * dir.y;
-          float yz = dir.y * dir.z;
-          float xz = dir.x * dir.z;
-
-          float sh2_basis0 =  1.0925484305920792  * xy;
-          float sh2_basis1 =  1.0925484305920792  * yz;
-          float sh2_basis2 =  0.31539156525252005 * (2.0 * zz - xx - yy);
-          float sh2_basis3 =  1.0925484305920792  * xz;
-          float sh2_basis4 =  0.5462742152960396  * (xx - yy);
-
-          color += pick5(sh2_basis0, sh2_basis1, sh2_basis2, sh2_basis3, sh2_basis4, uSh2BasisOrderA.x) * sh2_0;
-          color += pick5(sh2_basis0, sh2_basis1, sh2_basis2, sh2_basis3, sh2_basis4, uSh2BasisOrderA.y) * sh2_1;
-          color += pick5(sh2_basis0, sh2_basis1, sh2_basis2, sh2_basis3, sh2_basis4, uSh2BasisOrderA.z) * sh2_2;
-          color += pick5(sh2_basis0, sh2_basis1, sh2_basis2, sh2_basis3, sh2_basis4, uSh2BasisOrderA.w) * sh2_3;
-          color += pick5(sh2_basis0, sh2_basis1, sh2_basis2, sh2_basis3, sh2_basis4, uSh2BasisOrderB) * sh2_4;
-        }
-
-        if (degree >= 3) {
-          float xx = dir.x * dir.x;
-          float yy = dir.y * dir.y;
-          float zz = dir.z * dir.z;
-
-          float sh3_basis0 = -0.5900435899266435 * dir.y * (3.0 * xx - yy);
-          float sh3_basis1 =  2.890611442640554  * dir.x * dir.y * dir.z;
-          float sh3_basis2 = -0.4570457994644658 * dir.y * (4.0 * zz - xx - yy);
-          float sh3_basis3 =  0.3731763325901154 * dir.z * (2.0 * zz - 3.0 * xx - 3.0 * yy);
-          float sh3_basis4 = -0.4570457994644658 * dir.x * (4.0 * zz - xx - yy);
-          float sh3_basis5 =  1.445305721320277  * dir.z * (xx - yy);
-          float sh3_basis6 = -0.5900435899266435 * dir.x * (xx - 3.0 * yy);
-
-          color += sh3_0 * sh3_basis0;
-          color += sh3_1 * sh3_basis1;
-          color += sh3_2 * sh3_basis2;
-          color += sh3_3 * sh3_basis3;
-          color += sh3_4 * sh3_basis4;
-          color += sh3_5 * sh3_basis5;
-          color += sh3_6 * sh3_basis6;
-        }
-
-        color += 0.5;
-        
-        return max(color, 0.0);
-      }
+      ${SVRASTER_SH_EVALUATION_GLSL}
 
       vec3 diffHeatmap(vec3 colorA, vec3 colorB) {
         float diff = clamp(length(colorA - colorB) * uShDirDiffScale, 0.0, 1.0);
@@ -489,10 +431,36 @@ export class Viewer {
         vec4 posAndScale = fetch4(uPosScaleTexture, idx, 0, uPosScaleDims, 1);
         vec3 instancePosition = posAndScale.xyz;
         float instanceScale = posAndScale.w * uVoxelScaleMultiplier;
+        float unscaledScale = max(posAndScale.w, 1e-8);
+        int approxOctlevel = int(round(log2(max(uBaseVoxelSize / unscaledScale, 1.0))));
+        if (approxOctlevel < uMinVisibleOctlevel || approxOctlevel > uMaxVisibleOctlevel) {
+          gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+          vWorldPos = vec3(0.0);
+          vScale = 0.0;
+          vVoxelCenter = vec3(0.0);
+          vDensity0 = vec4(0.0);
+          vDensity1 = vec4(0.0);
+          vColor = vec3(0.0);
+          return;
+        }
         
         // Fetch grid values (2 vec4s per instance)
         vec4 gridValues1 = fetch4(uGridValuesTexture, idx, 0, uGridValuesDims, 2);
         vec4 gridValues2 = fetch4(uGridValuesTexture, idx, 1, uGridValuesDims, 2);
+        float gridMean = (
+          gridValues1.x + gridValues1.y + gridValues1.z + gridValues1.w +
+          gridValues2.x + gridValues2.y + gridValues2.z + gridValues2.w
+        ) / 8.0;
+        if (gridMean < uMinGridMean) {
+          gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+          vWorldPos = vec3(0.0);
+          vScale = 0.0;
+          vVoxelCenter = vec3(0.0);
+          vDensity0 = vec4(0.0);
+          vDensity1 = vec4(0.0);
+          vColor = vec3(0.0);
+          return;
+        }
         
         // SH1 uses 3 vec4s, SH2 uses 8 vec4s, SH3 uses 12 vec4s
         int shVec4s = (uShDegree >= 3) ? 12 : ((uShDegree >= 2) ? 8 : 3);
@@ -626,6 +594,8 @@ export class Viewer {
       uniform float uDensityThreshold;
       uniform float uRawDensityBias;
       uniform float uRawDensityScale;
+      uniform bool uExactRayMode;
+      uniform bool uReferenceIntegration;
       
       out vec4 fragColor;
       
@@ -665,6 +635,60 @@ export class Viewer {
         
         return vec2(tNear, tFar);
       }
+
+      vec2 intersectSlab(float origin, float direction, float slabMin, float slabMax) {
+        const float DIRECTION_EPSILON = 1e-8;
+        if (abs(direction) < DIRECTION_EPSILON) {
+          return (origin < slabMin || origin > slabMax)
+            ? vec2(1.0, -1.0)
+            : vec2(-1e30, 1e30);
+        }
+        float t0 = (slabMin - origin) / direction;
+        float t1 = (slabMax - origin) / direction;
+        return vec2(min(t0, t1), max(t0, t1));
+      }
+
+      vec2 exactRayBoxIntersection(vec3 rayOrigin, vec3 rayDir, vec3 boxCenter, float boxScale) {
+        vec3 localOrigin = (uInverseTransformMatrix * vec4(rayOrigin - boxCenter, 0.0)).xyz;
+        vec3 localDirection = (uInverseTransformMatrix * vec4(rayDir, 0.0)).xyz;
+        float halfExtent = boxScale * 0.5;
+
+        vec2 tx = intersectSlab(localOrigin.x, localDirection.x, -halfExtent, halfExtent);
+        vec2 ty = intersectSlab(localOrigin.y, localDirection.y, -halfExtent, halfExtent);
+        vec2 tz = intersectSlab(localOrigin.z, localDirection.z, -halfExtent, halfExtent);
+        float tNear = max(max(tx.x, ty.x), tz.x);
+        float tFar = min(min(tx.y, ty.y), tz.y);
+        return vec2(max(tNear, 0.0), tFar);
+      }
+
+      float trilinearFromNormalized(vec3 normalizedPos, vec4 density0, vec4 density1) {
+        vec3 p = clamp(normalizedPos, 0.0, 1.0);
+        float fx = p.x;
+        float fy = p.y;
+        float fz = p.z;
+        float fx1 = 1.0 - fx;
+        float fy1 = 1.0 - fy;
+        float fz1 = 1.0 - fz;
+
+        float c00 = fx1 * density0.x + fx * density1.x;
+        float c01 = fx1 * density0.y + fx * density1.y;
+        float c10 = fx1 * density0.z + fx * density1.z;
+        float c11 = fx1 * density0.w + fx * density1.w;
+        float c0 = fy1 * c00 + fy * c10;
+        float c1 = fy1 * c01 + fy * c11;
+        return fz1 * c0 + fz * c1;
+      }
+
+      float exactTrilinearInterpolation(
+        vec3 worldPos,
+        vec3 boxCenter,
+        float boxScale,
+        vec4 density0,
+        vec4 density1
+      ) {
+        vec3 localOffset = (uInverseTransformMatrix * vec4(worldPos - boxCenter, 0.0)).xyz;
+        return trilinearFromNormalized(localOffset / boxScale + 0.5, density0, density1);
+      }
       
       // Modified trilinear interpolation for arbitrary transforms
       float trilinearInterpolation(vec3 pos, vec3 boxMin, vec3 boxMax, vec4 density0, vec4 density1) {
@@ -691,34 +715,7 @@ export class Viewer {
         // 5. Clamp to ensure we're in the valid range [0,1]
         originalNormalizedPos = clamp(originalNormalizedPos, 0.0, 1.0);
         
-        // Now use these coordinates to sample the grid values in their original orientation
-        float fx = originalNormalizedPos.x;
-        float fy = originalNormalizedPos.y;
-        float fz = originalNormalizedPos.z;
-        float fx1 = 1.0 - fx;
-        float fy1 = 1.0 - fy;
-        float fz1 = 1.0 - fz;
-        
-        // Standard grid corner ordering
-        float c000 = density0.x; // Corner [0,0,0]
-        float c001 = density0.y; // Corner [0,0,1]
-        float c010 = density0.z; // Corner [0,1,0]
-        float c011 = density0.w; // Corner [0,1,1]
-        float c100 = density1.x; // Corner [1,0,0]
-        float c101 = density1.y; // Corner [1,0,1]
-        float c110 = density1.z; // Corner [1,1,0]
-        float c111 = density1.w; // Corner [1,1,1]
-        
-        // Trilinear interpolation using original-space coordinates
-        float c00 = fx1 * c000 + fx * c100;
-        float c01 = fx1 * c001 + fx * c101;
-        float c10 = fx1 * c010 + fx * c110;
-        float c11 = fx1 * c011 + fx * c111;
-        
-        float c0 = fy1 * c00 + fy * c10;
-        float c1 = fy1 * c01 + fy * c11;
-        
-        return fz1 * c0 + fz * c1;
+        return trilinearFromNormalized(originalNormalizedPos, density0, density1);
       }
 
       float flatDensity(vec4 density0, vec4 density1) {
@@ -761,7 +758,9 @@ export class Viewer {
         vec3 rayDir = normalize(vWorldPos - uCameraPosition);
         
         // Get ray-box intersection
-        vec2 tIntersect = rayBoxIntersection(rayOrigin, rayDir, vVoxelCenter, vScale);
+        vec2 tIntersect = uExactRayMode
+          ? exactRayBoxIntersection(rayOrigin, rayDir, vVoxelCenter, vScale)
+          : rayBoxIntersection(rayOrigin, rayDir, vVoxelCenter, vScale);
         float tNear = max(0.0, tIntersect.x);
         float tFar = min(tIntersect.y, 1000.0);
         
@@ -793,15 +792,23 @@ export class Viewer {
           float baseJitter = hash13(entryPoint * 19.19 + vVoxelCenter * 7.13);
           
           for (int i = 0; i < SAMPLE_COUNT; i++) {
-            // Jitter each stratum slightly to break up coherent banding on thin geometry.
-            float sampleJitter = fract(baseJitter + float(i) * 0.61803398875);
-            float t = tNear + (tFar - tNear) * (float(i) + sampleJitter) / float(SAMPLE_COUNT);
+            float sampleOffset = uReferenceIntegration
+              ? 0.5
+              : fract(baseJitter + float(i) * 0.61803398875);
+            float t = tNear + (tFar - tNear) * (float(i) + sampleOffset) / float(SAMPLE_COUNT);
             vec3 samplePoint = rayOrigin + rayDir * t;
             
             // Get density at sample point
-            float rawDensity = (uDensityMode == 1)
-              ? flatDensity(vDensity0, vDensity1)
-              : trilinearInterpolation(samplePoint, boxMin, boxMax, vDensity0, vDensity1);
+            float rawDensity;
+            if (uDensityMode == 1) {
+              rawDensity = flatDensity(vDensity0, vDensity1);
+            } else if (uExactRayMode) {
+              rawDensity = exactTrilinearInterpolation(
+                samplePoint, vVoxelCenter, vScale, vDensity0, vDensity1
+              );
+            } else {
+              rawDensity = trilinearInterpolation(samplePoint, boxMin, boxMax, vDensity0, vDensity1);
+            }
             rawDensityAccum += rawDensity;
             
             // Apply selected density transfer and accumulate
@@ -817,7 +824,10 @@ export class Viewer {
           }
           
           // Use view space ray length for Beer-Lambert law
-          float alpha = 1.0 - exp(-totalDensity);
+          float alpha = min(0.99999, 1.0 - exp(-totalDensity));
+          if (alpha < 0.00001) {
+            discard;
+          }
 
           if (uDebugRenderMode == 1) {
             // Keep premultiplied-alpha semantics in debug mode too.
@@ -827,6 +837,8 @@ export class Viewer {
             float thickness = max(0.0, tFar - tNear);
             float thicknessVis = clamp(thickness / max(vScale, 1e-5), 0.0, 1.0);
             fragColor = vec4(vec3(thicknessVis), 1.0);
+          } else if (uDebugRenderMode == 5) {
+            fragColor = vec4(clamp(vColor, 0.0, 1.0), 1.0);
           } else {
             // Premultiply the color by alpha
             vec3 premultipliedColor = vColor * alpha;
@@ -1078,7 +1090,7 @@ export class Viewer {
     
     // Clear the canvas with a slightly visible color to see if rendering is happening
     // gl.clearColor(1.0 / 255.0, 121.0 / 255.0, 51.0 / 255.0, 1.0); 
-    gl.clearColor(0.0, 0.0, 0.0, 1.0);
+    gl.clearColor(0.0, 0.0, 0.0, 0.0);
     this.applyRenderState();
     if (this.depthTestEnabled) {
       gl.clearDepth(1.0);
@@ -1148,6 +1160,10 @@ export class Viewer {
       this.voxelScaleMultiplier
     );
     gl.uniform1f(
+      gl.getUniformLocation(this.program, 'uBaseVoxelSize'),
+      this.baseVoxelSize
+    );
+    gl.uniform1f(
       gl.getUniformLocation(this.program, 'uStepScale'),
       this.stepScale
     );
@@ -1170,6 +1186,26 @@ export class Viewer {
     gl.uniform1f(
       gl.getUniformLocation(this.program, 'uRawDensityScale'),
       this.rawDensityScale
+    );
+    gl.uniform1i(
+      gl.getUniformLocation(this.program, 'uMinVisibleOctlevel'),
+      this.minVisibleOctlevel
+    );
+    gl.uniform1i(
+      gl.getUniformLocation(this.program, 'uMaxVisibleOctlevel'),
+      this.maxVisibleOctlevel
+    );
+    gl.uniform1f(
+      gl.getUniformLocation(this.program, 'uMinGridMean'),
+      this.minGridMean
+    );
+    gl.uniform1i(
+      gl.getUniformLocation(this.program, 'uExactRayMode'),
+      this.exactRayMode ? 1 : 0
+    );
+    gl.uniform1i(
+      gl.getUniformLocation(this.program, 'uReferenceIntegration'),
+      this.referenceIntegration ? 1 : 0
     );
     gl.uniform3i(
       gl.getUniformLocation(this.program, 'uSh1BasisOrder'),
@@ -1248,11 +1284,28 @@ export class Viewer {
     positions: Float32Array, 
     sh0Values: Float32Array,
     octlevels: Uint8Array,
-    octpaths: Uint32Array,
+    octpathLow: Uint32Array,
     gridValues: Float32Array,
-    shRestValues?: Float32Array
+    shRestValues?: Float32Array,
+    octpathHigh?: Uint32Array
   ): void {
-    console.log(`Loading point cloud with ${positions.length / 3} points`);
+    const vertexCount = positions.length / 3;
+    const requiredRestCount = this.getRestCountForShDegree();
+    if (!Number.isInteger(vertexCount)) {
+      throw new Error('Position data must contain exactly three values per vertex');
+    }
+    if (!shRestValues || shRestValues.length === 0) {
+      throw new Error(`SH degree ${this.activeShDegree} requires ${requiredRestCount} rest values per vertex`);
+    }
+    const restPerVertex = shRestValues.length / vertexCount;
+    if (!Number.isInteger(restPerVertex) || restPerVertex < requiredRestCount) {
+      throw new Error(
+        `SH degree ${this.activeShDegree} requires ${requiredRestCount} rest values per vertex, ` +
+        `but received ${restPerVertex}`
+      );
+    }
+
+    console.log(`Loading point cloud with ${vertexCount} points`);
     
     // Save original data (we still need it for the sort worker)
     this.originalPositions = new Float32Array(positions);
@@ -1260,48 +1313,54 @@ export class Viewer {
     // Save SH0 (base colors)
     this.originalSH0Values = new Float32Array(sh0Values);
     
-    // We need space for 9 values per vertex
-    
-    // Extract SH1 coefficients from shRestValues if provided
-    if (shRestValues && shRestValues.length > 0) {
-      // Each vertex has multiple rest values. Keep SH1 only in sh=1 mode, SH1+SH2 in sh=2 mode.
-      const restPerVertex = shRestValues.length / positions.length * 3;
-      const restCount = this.getRestCountForShDegree();
-      console.log(`Found ${restPerVertex} rest values per vertex, extracting ${restCount} values per vertex`);
-      
-      // Allocate exactly what current SH mode needs to preserve original SH1 path
-      this.originalSH1Values = new Float32Array(positions.length / 3 * restCount);
-      
-      for (let i = 0; i < positions.length / 3; i++) {
-        for (let j = 0; j < restCount; j++) {
-          // Only extract if we have enough values
-          if (j < restPerVertex) {
-            this.originalSH1Values[i * restCount + j] = shRestValues[i * restPerVertex + j];
-          } else {
-            // If not enough rest values, set to 0
-            this.originalSH1Values[i * restCount + j] = 0.0;
-          }
-        }
+    console.log(
+      `Found ${restPerVertex} rest values per vertex, extracting ${requiredRestCount} values per vertex`
+    );
+    this.originalSH1Values = new Float32Array(vertexCount * requiredRestCount);
+
+    for (let i = 0; i < vertexCount; i++) {
+      for (let j = 0; j < requiredRestCount; j++) {
+        this.originalSH1Values[i * requiredRestCount + j] = shRestValues[i * restPerVertex + j];
       }
-      
-      console.log(`Extracted ${this.originalSH1Values.length / restCount} SH sets with ${restCount} values each`);
-      console.log('SH1 sample values (first vertex):', 
-                this.originalSH1Values.slice(0, 9));
-    } else {
-      // If no rest values provided, use zeros (no directional lighting)
-      this.originalSH1Values = new Float32Array(positions.length / 3 * this.getRestCountForShDegree());
-      console.log('No SH1 values provided, using default (no directional lighting)');
     }
-    
-    // Save octree data
-    this.originalOctlevels = new Uint8Array(octlevels);
+    console.log(
+      `Extracted ${this.originalSH1Values.length / requiredRestCount} SH sets ` +
+      `with ${requiredRestCount} values each`
+    );
+    console.log('SH sample values (first vertex):', this.originalSH1Values.slice(0, 9));
     
     this.originalScales = new Float32Array(octlevels.length);
     for (let i = 0; i < octlevels.length; i++) {
       this.originalScales[i] = this.baseVoxelSize * Math.pow(2, -octlevels[i]);
     }
-    
-    this.originalOctpaths = new Uint32Array(octpaths);
+
+    if (this.sortMetric === 'morton') {
+      if (octpathHigh && octpathHigh.length === vertexCount) {
+        this.originalOctpathLow = new Uint32Array(octpathLow);
+        this.originalOctpathHigh = new Uint32Array(octpathHigh);
+      } else {
+        const reconstructed = MortonSorter.encodeOctpathsFromPositions(
+          positions,
+          octlevels,
+          this.sceneCenter,
+          this.sceneExtent
+        );
+        let lowWordMismatches = 0;
+        for (let index = 0; index < vertexCount; index++) {
+          if (reconstructed.low[index] !== octpathLow[index]) {
+            lowWordMismatches++;
+          }
+        }
+        if (lowWordMismatches > 0) {
+          console.warn(
+            `Reconstructed octpaths differ from ${lowWordMismatches} legacy low words; ` +
+            'using paths reconstructed from voxel centers'
+          );
+        }
+        this.originalOctpathLow = reconstructed.low;
+        this.originalOctpathHigh = reconstructed.high;
+      }
+    }
     
     // Save grid values
     console.log(`Saving ${gridValues.length} grid values`);
@@ -1429,7 +1488,7 @@ export class Viewer {
     this.shDirDiffScale = Math.max(0.1, scale);
   }
 
-  public setDebugRenderMode(mode: 'normal' | 'alpha' | 'thickness' | 'solid' | 'rawdensity'): void {
+  public setDebugRenderMode(mode: 'normal' | 'alpha' | 'thickness' | 'solid' | 'rawdensity' | 'albedo'): void {
     if (mode === 'alpha') {
       this.debugRenderMode = 1;
     } else if (mode === 'thickness') {
@@ -1438,6 +1497,8 @@ export class Viewer {
       this.debugRenderMode = 3;
     } else if (mode === 'rawdensity') {
       this.debugRenderMode = 4;
+    } else if (mode === 'albedo') {
+      this.debugRenderMode = 5;
     } else {
       this.debugRenderMode = 0;
     }
@@ -1452,6 +1513,16 @@ export class Viewer {
 
   public setSortingEnabled(enabled: boolean): void {
     this.sortingEnabled = enabled;
+  }
+
+  public setSortMetric(metric: 'distance' | 'depth' | 'morton'): void {
+    this.sortMetric = metric;
+    this.requestSort();
+  }
+
+  public setCompositeMode(mode: 'back' | 'front'): void {
+    this.compositeMode = mode;
+    this.requestSort();
   }
 
   public setDensityMode(mode: 'trilinear' | 'flat'): void {
@@ -1483,6 +1554,10 @@ export class Viewer {
     this.depthTestEnabled = enabled;
   }
 
+  public setCullingEnabled(enabled: boolean): void {
+    this.cullingEnabled = enabled;
+  }
+
   public setVoxelScaleMultiplier(multiplier: number): void {
     if (!Number.isFinite(multiplier)) {
       return;
@@ -1502,6 +1577,35 @@ export class Viewer {
       return;
     }
     this.rawDensityScale = Math.max(0.001, scale);
+  }
+
+  public setVisibleOctlevelRange(minLevel: number, maxLevel: number): void {
+    if (!Number.isFinite(minLevel) || !Number.isFinite(maxLevel)) {
+      return;
+    }
+    const clampedMin = Math.max(0, Math.min(16, Math.floor(minLevel)));
+    const clampedMax = Math.max(clampedMin, Math.min(16, Math.floor(maxLevel)));
+    this.minVisibleOctlevel = clampedMin;
+    this.maxVisibleOctlevel = clampedMax;
+  }
+
+  public setMinGridMean(value: number): void {
+    if (!Number.isFinite(value)) {
+      return;
+    }
+    this.minGridMean = value;
+  }
+
+  public setExactRayMode(enabled: boolean): void {
+    this.exactRayMode = enabled;
+  }
+
+  public setReferenceIntegration(enabled: boolean): void {
+    this.referenceIntegration = enabled;
+  }
+
+  public getRasterSampleCount(): number {
+    return this.rasterSampleCount;
   }
 
   public setRenderScale(scale: number): void {
@@ -1590,8 +1694,8 @@ export class Viewer {
     this.originalScales = null;
     this.originalGridValues1 = null;
     this.originalGridValues2 = null;
-    this.originalOctlevels = null;
-    this.originalOctpaths = null;
+    this.originalOctpathLow = null;
+    this.originalOctpathHigh = null;
     this.originalSH1Values = null;
     this.sortedIndices = null;
     
@@ -1606,6 +1710,8 @@ export class Viewer {
    * Set scene parameters from PLY file header
    */
   public setSceneParameters(center: [number, number, number], extent: number): void {
+    this.sceneCenter = [...center];
+    this.sceneExtent = extent;
     this.baseVoxelSize = extent; // Use the extent as the base voxel size
     
     console.log(`Scene center: [${center}], extent: ${extent}, base voxel size: ${this.baseVoxelSize}`);
@@ -1710,43 +1816,36 @@ export class Viewer {
     // Clone positions to send to worker
     const positions = new Float32Array(this.originalPositions);
     
-    // Create copies of octree data to send to worker
-    let octlevels: Uint8Array | undefined = undefined;
-    let octpaths: Uint32Array | undefined = undefined;
-    
-    // Use the original octree data if available
-    if (this.originalOctlevels) {
-      octlevels = new Uint8Array(this.originalOctlevels);
-    }
-    
-    if (this.originalOctpaths) {
-      octpaths = new Uint32Array(this.originalOctpaths);
-    }
-    
     // Create a copy of the scene transform matrix
     const transformMatrix = new Float32Array(this.sceneTransformMatrix);
     
     // Send the data to the worker
-    this.sortWorker.postMessage({
+    const request: {
+      type: 'sort';
+      positions: Float32Array;
+      cameraPosition: vec3;
+      cameraTarget: vec3;
+      sceneTransformMatrix: Float32Array;
+      sortMetric: 'distance' | 'depth' | 'morton';
+      compositeMode: 'back' | 'front';
+      octpathLow?: Uint32Array;
+      octpathHigh?: Uint32Array;
+    } = {
       type: 'sort',
       positions: positions,
       cameraPosition: cameraPos,
       cameraTarget: cameraTarget,
       sceneTransformMatrix: transformMatrix,
-      octlevels: octlevels,
-      octpaths: octpaths
-    }, [positions.buffer]);
-    
-    // Transfer buffers to avoid copying large data
-    if (octlevels) {
-      this.sortWorker.postMessage({}, [octlevels.buffer]);
+      sortMetric: this.sortMetric,
+      compositeMode: this.compositeMode
+    };
+    const transferables: Transferable[] = [positions.buffer, transformMatrix.buffer];
+    if (this.sortMetric === 'morton' && this.originalOctpathLow && this.originalOctpathHigh) {
+      request.octpathLow = new Uint32Array(this.originalOctpathLow);
+      request.octpathHigh = new Uint32Array(this.originalOctpathHigh);
+      transferables.push(request.octpathLow.buffer, request.octpathHigh.buffer);
     }
-    
-    if (octpaths) {
-      this.sortWorker.postMessage({}, [octpaths.buffer]);
-    }
-    
-    this.sortWorker.postMessage({}, [transformMatrix.buffer]);
+    this.sortWorker.postMessage(request, transferables);
   }
 
 
@@ -2345,9 +2444,11 @@ export class Viewer {
   private getSampleCountFromURL(): number {
     const urlParams = new URLSearchParams(window.location.search);
     const quality = (urlParams.get('quality') || '').toLowerCase();
-    // A slightly higher default reduces visible striping/shimmer in SH1 mode
-    // while preserving the existing `?samples=` escape hatch for performance.
-    const fallbackSamples = quality === 'detail' ? '12' : quality === 'preview' ? '4' : '8';
+    const referenceIntegration =
+      (urlParams.get('integrationMode') || '').toLowerCase() !== 'jittered';
+    const fallbackSamples = referenceIntegration
+      ? '3'
+      : quality === 'detail' ? '12' : quality === 'preview' ? '4' : '8';
     const sampleCount = parseInt(urlParams.get('samples') || fallbackSamples, 10);
     // Ensure the count is at least 1 and not too high for performance
     return Math.max(1, Math.min(sampleCount, 64));

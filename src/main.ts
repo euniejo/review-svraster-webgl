@@ -1,7 +1,8 @@
 import './style.css';
 import { Viewer } from './lib/Viewer';
 import { Camera } from './lib/Camera';
-import { LoadPLY } from './lib/LoadPLY';
+import { LoadPLY, type PLYData } from './lib/LoadPLY';
+import { getRequiredShRestCount } from './lib/SphericalHarmonics';
 
 // Add these at the top of the file, after imports
 let progressContainer: HTMLDivElement;
@@ -13,6 +14,159 @@ let currentViewer: Viewer;
 let currentCamera: Camera;
 let mainInfoDisplay: HTMLElement;
 let requestedShDegree: number | null = null;
+let activeSampleCount = 3;
+
+type CompareMode = 'sh13' | 'viewdir' | 'tuning' | 'preset';
+type PresetGroup = 'baseline' | 'quality' | 'diagnostic';
+
+const VIEW_TUNING_KEYS = [
+  'quality',
+  'inspect',
+  'sh',
+  'disableSh2',
+  'sh1map',
+  'sh2map',
+  'shViewDir',
+  'shDebug',
+  'shDiffScale',
+  'renderDebug',
+  'stepScale',
+  'sort',
+  'sortMode',
+  'compositeMode',
+  'densityMode',
+  'densityTransfer',
+  'densityThreshold',
+  'rawDensityBias',
+  'rawDensityScale',
+  'minOct',
+  'maxOct',
+  'minGridMean',
+  'blend',
+  'depth',
+  'cull',
+  'voxelScale',
+  'integrationMode',
+  'rayMode',
+  'samples',
+  'renderScale'
+] as const;
+
+interface CameraState {
+  position: [number, number, number];
+  target: [number, number, number];
+}
+
+interface CompareCameraMessage {
+  type: 'compare-camera';
+  channelId: string;
+  pane: 'left' | 'right';
+  state: CameraState;
+}
+
+interface TestPreset {
+  id: string;
+  label: string;
+  description: string;
+  group: PresetGroup;
+  overrides: Record<string, string | null>;
+}
+
+function createViewerOverrides(
+  changes: Record<string, string | null> = {}
+): Record<string, string | null> {
+  const overrides: Record<string, string | null> = {
+    compare: null,
+    viewPreset: null
+  };
+  for (const key of VIEW_TUNING_KEYS) {
+    overrides[key] = null;
+  }
+  return { ...overrides, ...changes };
+}
+
+const TEST_PRESETS: TestPreset[] = [
+  {
+    id: 'original',
+    label: 'Viewer Baseline (SH1)',
+    description: '뷰어 기본값을 사용하는 SH1 기준 화면',
+    group: 'baseline',
+    overrides: createViewerOverrides({ sh: '1' })
+  },
+  {
+    id: 'linear',
+    label: 'Linear Only',
+    description: 'density transfer만 explin에서 linear로 변경',
+    group: 'quality',
+    overrides: createViewerOverrides({ sh: '1', densityTransfer: 'linear' })
+  },
+  {
+    id: 'samples',
+    label: 'Samples x8',
+    description: '복셀 내부 ray integration 샘플을 3개에서 8개로 증가',
+    group: 'quality',
+    overrides: createViewerOverrides({ sh: '1', samples: '8' })
+  },
+  {
+    id: 'sh3',
+    label: 'SH3 Only',
+    description: '다른 렌더링 값은 유지하고 SH 차수만 3으로 증가',
+    group: 'quality',
+    overrides: createViewerOverrides({ sh: '3' })
+  },
+  {
+    id: 'flat',
+    label: 'Flat Density',
+    description: 'trilinear 보간 대신 8개 corner density의 평균값을 사용',
+    group: 'quality',
+    overrides: createViewerOverrides({ sh: '1', densityMode: 'flat' })
+  },
+  {
+    id: 'linear-samples',
+    label: 'Linear + Samples x8',
+    description: 'linear transfer와 samples=8의 조합 효과 확인',
+    group: 'quality',
+    overrides: createViewerOverrides({ sh: '1', densityTransfer: 'linear', samples: '8' })
+  },
+  {
+    id: 'alpha',
+    label: 'Alpha Debug',
+    description: '최종 alpha 누적값을 흑백으로 표시',
+    group: 'diagnostic',
+    overrides: createViewerOverrides({ sh: '1', renderDebug: 'alpha' })
+  },
+  {
+    id: 'albedo',
+    label: 'Albedo Debug',
+    description: 'alpha discard를 통과한 fragment의 SH1 색상값을 불투명으로 표시',
+    group: 'diagnostic',
+    overrides: createViewerOverrides({
+      sh: '1',
+      renderDebug: 'albedo',
+      blend: 'off',
+      depth: 'on'
+    })
+  },
+  {
+    id: 'thickness',
+    label: 'Thickness Debug',
+    description: '카메라 ray가 각 복셀을 통과한 두께를 표시',
+    group: 'diagnostic',
+    overrides: createViewerOverrides({ sh: '1', renderDebug: 'thickness' })
+  },
+  {
+    id: 'solid',
+    label: 'Solid Debug',
+    description: 'density를 제외하고 복셀 proxy geometry의 화면 점유만 표시',
+    group: 'diagnostic',
+    overrides: createViewerOverrides({
+      sh: '1',
+      renderDebug: 'solid',
+      blend: 'off',
+      depth: 'on'
+    })
+  }
+];
 
 // Create a function to initialize the progress bar
 function createProgressBar() {
@@ -99,13 +253,482 @@ function parseIndexList(value: string | null, expectedLength: number, maxIndex: 
   return parsed;
 }
 
+function getCameraState(camera: Camera): CameraState {
+  const position = camera.getPosition();
+  const target = camera.getTarget();
+  return {
+    position: [position[0], position[1], position[2]],
+    target: [target[0], target[1], target[2]]
+  };
+}
+
+function serializeCameraState(state: CameraState): string {
+  return [...state.position, ...state.target].map((value) => value.toFixed(4)).join(',');
+}
+
+function parseCameraState(value: string | null): CameraState | null {
+  if (!value) {
+    return null;
+  }
+  const values = value.split(',').map((item) => Number.parseFloat(item));
+  if (values.length !== 6 || values.some((item) => !Number.isFinite(item))) {
+    return null;
+  }
+  return {
+    position: [values[0], values[1], values[2]],
+    target: [values[3], values[4], values[5]]
+  };
+}
+
+function applyCameraState(camera: Camera, state: CameraState) {
+  camera.setPosition(state.position[0], state.position[1], state.position[2]);
+  camera.setTarget(state.target[0], state.target[1], state.target[2]);
+}
+
+function buildComparePaneUrl(
+  baseParams: URLSearchParams,
+  pane: 'left' | 'right',
+  channelId: string,
+  overrides: Record<string, string | null>
+): string {
+  const params = new URLSearchParams(baseParams);
+  params.delete('compare');
+  params.delete('compareChild');
+  params.delete('comparePane');
+  params.delete('compareChannel');
+  params.delete('comparePreset');
+  params.delete('compareCamera');
+  params.delete('viewPreset');
+
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === null) {
+      params.delete(key);
+    } else {
+      params.set(key, value);
+    }
+  }
+
+  params.set('compareChild', '1');
+  params.set('comparePane', pane);
+  params.set('compareChannel', channelId);
+  return `${window.location.pathname}?${params.toString()}`;
+}
+
+function applyViewerDefaults(viewer: Viewer): void {
+  viewer.setDisableSh2(false);
+  viewer.setUseVoxelToCameraShDir(false);
+  viewer.setShComparisonMode('normal');
+  viewer.setShDirDiffScale(8.0);
+  viewer.setDebugRenderMode('normal');
+  viewer.setRenderScale(1.0);
+  viewer.setStepScale(100.0);
+  viewer.setSortingEnabled(true);
+  viewer.setSortMetric('depth');
+  viewer.setCompositeMode('back');
+  viewer.setDensityMode('trilinear');
+  viewer.setDensityTransferMode('explin');
+  viewer.setDensityThreshold(0.0);
+  viewer.setBlendingEnabled(true);
+  viewer.setDepthTestEnabled(false);
+  viewer.setCullingEnabled(true);
+  viewer.setVoxelScaleMultiplier(1.0);
+  viewer.setRawDensityBias(2.0);
+  viewer.setRawDensityScale(0.2);
+  viewer.setVisibleOctlevelRange(0, 16);
+  viewer.setMinGridMean(-1000.0);
+  viewer.setExactRayMode(true);
+}
+
+function createComparePane(
+  label: string,
+  src: string,
+  pane: 'left' | 'right'
+): { wrapper: HTMLDivElement; iframe: HTMLIFrameElement } {
+  const wrapper = document.createElement('div');
+  wrapper.style.position = 'relative';
+  wrapper.style.minWidth = '0';
+  wrapper.style.background = '#000';
+  wrapper.style.overflow = 'hidden';
+  wrapper.style.borderLeft = pane === 'right' ? '1px solid rgba(255,255,255,0.14)' : 'none';
+
+  const badge = document.createElement('div');
+  badge.textContent = label;
+  badge.style.position = 'absolute';
+  badge.style.top = '12px';
+  badge.style.left = '12px';
+  badge.style.zIndex = '2';
+  badge.style.padding = '6px 10px';
+  badge.style.borderRadius = '999px';
+  badge.style.background = 'rgba(0, 0, 0, 0.65)';
+  badge.style.color = 'white';
+  badge.style.fontFamily = 'sans-serif';
+  badge.style.fontSize = '12px';
+  badge.style.letterSpacing = '0.04em';
+  badge.style.textTransform = 'uppercase';
+
+  const iframe = document.createElement('iframe');
+  iframe.src = src;
+  iframe.title = label;
+  iframe.style.width = '100%';
+  iframe.style.height = '100%';
+  iframe.style.border = '0';
+  iframe.style.display = 'block';
+
+  wrapper.appendChild(iframe);
+  wrapper.appendChild(badge);
+  return { wrapper, iframe };
+}
+
+function initCompareSync(
+  channelId: string,
+  leftFrame: HTMLIFrameElement,
+  rightFrame: HTMLIFrameElement
+): () => CameraState | null {
+  let latestState: CameraState | null = null;
+  window.addEventListener('message', (event: MessageEvent) => {
+    if (event.origin !== window.location.origin) {
+      return;
+    }
+
+    const data = event.data as CompareCameraMessage | undefined;
+    if (!data || data.type !== 'compare-camera' || data.channelId !== channelId) {
+      return;
+    }
+
+    latestState = data.state;
+    const target = data.pane === 'left' ? rightFrame.contentWindow : leftFrame.contentWindow;
+    target?.postMessage(data, window.location.origin);
+  });
+  return () => latestState;
+}
+
+function addPresetCompareController(
+  urlParams: URLSearchParams,
+  channelId: string,
+  rightPane: { wrapper: HTMLDivElement; iframe: HTMLIFrameElement },
+  getLatestCameraState: () => CameraState | null
+): void {
+  const selectedPreset =
+    TEST_PRESETS.find((preset) => preset.id === urlParams.get('comparePreset')) ?? TEST_PRESETS[1];
+
+  const panel = document.createElement('div');
+  panel.style.position = 'fixed';
+  panel.style.top = '12px';
+  panel.style.right = '12px';
+  panel.style.zIndex = '12';
+  panel.style.width = '280px';
+  panel.style.padding = '10px';
+  panel.style.borderRadius = '10px';
+  panel.style.background = 'rgba(0, 0, 0, 0.72)';
+  panel.style.color = 'white';
+  panel.style.fontFamily = 'sans-serif';
+  panel.style.backdropFilter = 'blur(10px)';
+  panel.style.maxHeight = 'calc(100vh - 24px)';
+  panel.style.overflowY = 'auto';
+
+  const title = document.createElement('div');
+  title.textContent = 'Preset Compare';
+  title.style.fontSize = '13px';
+  title.style.fontWeight = '600';
+  title.style.marginBottom = '6px';
+
+  const subtitle = document.createElement('div');
+  subtitle.textContent = 'Left stays on the SH1 baseline. Only the right preset reloads.';
+  subtitle.style.fontSize = '12px';
+  subtitle.style.opacity = '0.82';
+  subtitle.style.marginBottom = '8px';
+
+  const select = document.createElement('select');
+  select.style.width = '100%';
+  select.style.padding = '6px 8px';
+  select.style.borderRadius = '6px';
+  select.style.border = '1px solid rgba(255,255,255,0.18)';
+  select.style.background = 'rgba(255,255,255,0.08)';
+  select.style.color = 'white';
+  select.style.marginBottom = '8px';
+
+  const groupLabels: Record<Exclude<PresetGroup, 'baseline'>, string> = {
+    quality: 'Quality Tests',
+    diagnostic: 'Render Diagnostics'
+  };
+  for (const group of ['quality', 'diagnostic'] as const) {
+    const optionGroup = document.createElement('optgroup');
+    optionGroup.label = groupLabels[group];
+    TEST_PRESETS.filter((preset) => preset.group === group).forEach((preset) => {
+      const option = document.createElement('option');
+      option.value = preset.id;
+      option.textContent = preset.label;
+      option.selected = preset.id === selectedPreset.id;
+      optionGroup.appendChild(option);
+    });
+    select.appendChild(optionGroup);
+  }
+
+  const description = document.createElement('div');
+  description.style.fontSize = '12px';
+  description.style.opacity = '0.86';
+  description.style.minHeight = '2.4em';
+  description.style.marginBottom = '8px';
+
+  const rightBadge = rightPane.wrapper.querySelector('div');
+
+  const setPreset = (presetId: string) => {
+    const preset = TEST_PRESETS.find((item) => item.id === presetId) ?? TEST_PRESETS[1];
+    description.textContent = preset.description;
+    select.value = preset.id;
+    const cameraState = getLatestCameraState();
+    const overrides = {
+      ...preset.overrides,
+      compareCamera: cameraState ? serializeCameraState(cameraState) : null
+    };
+    rightPane.iframe.src = buildComparePaneUrl(urlParams, 'right', channelId, overrides);
+    if (rightBadge) {
+      rightBadge.textContent = `Right: ${preset.label}`;
+    }
+    const nextParams = new URLSearchParams(window.location.search);
+    nextParams.set('compare', 'preset');
+    nextParams.set('comparePreset', preset.id);
+    window.history.replaceState({}, '', `${window.location.pathname}?${nextParams.toString()}`);
+  };
+
+  select.addEventListener('change', () => setPreset(select.value));
+  description.textContent = selectedPreset.description;
+
+  panel.append(title, subtitle, select, description);
+  document.body.appendChild(panel);
+}
+
+function setupCompareLayout(compareMode: CompareMode, urlParams: URLSearchParams) {
+  const root = document.getElementById('app');
+  if (!root) {
+    throw new Error('App root not found');
+  }
+
+  document.body.style.margin = '0';
+  document.body.style.background = '#050505';
+  root.innerHTML = '';
+  root.style.width = '100vw';
+  root.style.height = '100vh';
+  root.style.display = 'grid';
+  root.style.gridTemplateColumns = '1fr 1fr';
+  root.style.background = '#050505';
+
+  const channelId = `${compareMode}-${Date.now()}`;
+  const selectedPreset =
+    TEST_PRESETS.find((preset) => preset.id === urlParams.get('comparePreset')) ?? TEST_PRESETS[1];
+  const paneConfigs =
+    compareMode === 'sh13'
+      ? [
+          {
+            pane: 'left' as const,
+            label: 'Left: SH1',
+            src: buildComparePaneUrl(
+              urlParams,
+              'left',
+              channelId,
+              createViewerOverrides({ sh: '1' })
+            )
+          },
+          {
+            pane: 'right' as const,
+            label: 'Right: SH3',
+            src: buildComparePaneUrl(
+              urlParams,
+              'right',
+              channelId,
+              createViewerOverrides({ sh: '3' })
+            )
+          }
+        ]
+      : compareMode === 'viewdir'
+        ? [
+          {
+            pane: 'left' as const,
+            label: 'Left: SH3 CameraToVoxel',
+            src: buildComparePaneUrl(
+              urlParams,
+              'left',
+              channelId,
+              createViewerOverrides({ sh: '3' })
+            )
+          },
+          {
+            pane: 'right' as const,
+            label: 'Right: SH3 VoxelToCamera',
+            src: buildComparePaneUrl(
+              urlParams,
+              'right',
+              channelId,
+              createViewerOverrides({ sh: '3', shViewDir: 'voxeltocamera' })
+            )
+          }
+        ]
+        : compareMode === 'tuning'
+          ? [
+            {
+              pane: 'left' as const,
+              label: 'Left: Linear Only',
+              src: buildComparePaneUrl(
+                urlParams,
+                'left',
+                channelId,
+                createViewerOverrides({ sh: '1', densityTransfer: 'linear' })
+              )
+            },
+            {
+              pane: 'right' as const,
+              label: 'Right: Samples x8 Only',
+              src: buildComparePaneUrl(
+                urlParams,
+                'right',
+                channelId,
+                createViewerOverrides({ sh: '1', samples: '8' })
+              )
+            }
+          ]
+        : [
+            {
+              pane: 'left' as const,
+              label: 'Left: Viewer Baseline (SH1)',
+              src: buildComparePaneUrl(
+                urlParams,
+                'left',
+                channelId,
+                createViewerOverrides({ sh: '1' })
+              )
+            },
+            {
+              pane: 'right' as const,
+              label: `Right: ${selectedPreset.label}`,
+              src: buildComparePaneUrl(
+                urlParams,
+                'right',
+                channelId,
+                selectedPreset.overrides
+              )
+            }
+          ];
+
+  const [leftPane, rightPane] = paneConfigs.map((config) =>
+    createComparePane(config.label, config.src, config.pane)
+  );
+
+  root.appendChild(leftPane.wrapper);
+  root.appendChild(rightPane.wrapper);
+
+  const header = document.createElement('div');
+  header.textContent = 'Split Compare: drag either side to sync both cameras';
+  header.style.position = 'fixed';
+  header.style.top = '12px';
+  header.style.left = '50%';
+  header.style.transform = 'translateX(-50%)';
+  header.style.zIndex = '10';
+  header.style.padding = '8px 12px';
+  header.style.borderRadius = '999px';
+  header.style.background = 'rgba(0, 0, 0, 0.72)';
+  header.style.color = 'white';
+  header.style.fontFamily = 'sans-serif';
+  header.style.fontSize = '12px';
+  header.style.pointerEvents = 'none';
+  document.body.appendChild(header);
+
+  const getLatestCameraState = initCompareSync(channelId, leftPane.iframe, rightPane.iframe);
+
+  if (compareMode === 'preset') {
+    addPresetCompareController(urlParams, channelId, rightPane, getLatestCameraState);
+  }
+}
+
+function setupCompareChildSync(camera: Camera, urlParams: URLSearchParams) {
+  const channelId = urlParams.get('compareChannel');
+  const pane = urlParams.get('comparePane');
+  if (!channelId || (pane !== 'left' && pane !== 'right') || window.parent === window) {
+    return;
+  }
+
+  let lastBroadcastKey = '';
+  let suppressBroadcastUntil = 0;
+
+  window.addEventListener('message', (event: MessageEvent) => {
+    if (event.origin !== window.location.origin) {
+      return;
+    }
+
+    const data = event.data as CompareCameraMessage | undefined;
+    if (!data || data.type !== 'compare-camera' || data.channelId !== channelId || data.pane === pane) {
+      return;
+    }
+
+    applyCameraState(camera, data.state);
+    lastBroadcastKey = serializeCameraState(data.state);
+    suppressBroadcastUntil = performance.now() + 150;
+  });
+
+  const publishLoop = () => {
+    const state = getCameraState(camera);
+    const key = serializeCameraState(state);
+    if (key !== lastBroadcastKey && performance.now() >= suppressBroadcastUntil) {
+      const message: CompareCameraMessage = {
+        type: 'compare-camera',
+        channelId,
+        pane,
+        state
+      };
+      window.parent.postMessage(message, window.location.origin);
+      lastBroadcastKey = key;
+    }
+    requestAnimationFrame(publishLoop);
+  };
+
+  requestAnimationFrame(publishLoop);
+}
+
+function renderModelInfo(
+  element: HTMLElement,
+  infoText: string,
+  shDegree: number,
+  requiredRestCount: number,
+  availableRestCount: number,
+  sampleCount: number
+) {
+  element.replaceChildren();
+
+  const details = document.createElement('div');
+  details.textContent = infoText;
+  details.style.whiteSpace = 'pre-line';
+
+  const shStatus = document.createElement('div');
+  shStatus.textContent =
+    `SH${shDegree} | coefficients ${requiredRestCount}/${availableRestCount} | ray samples ${sampleCount}`;
+  shStatus.title =
+    `Using ${requiredRestCount} of ${availableRestCount} SH rest coefficients available in the PLY`;
+  shStatus.style.display = 'inline-flex';
+  shStatus.style.marginTop = '8px';
+  shStatus.style.padding = '4px 7px';
+  shStatus.style.border = '1px solid rgba(134, 239, 172, 0.55)';
+  shStatus.style.borderRadius = '4px';
+  shStatus.style.background = 'rgba(20, 83, 45, 0.72)';
+  shStatus.style.color = '#dcfce7';
+  shStatus.style.fontFamily = 'monospace';
+  shStatus.style.fontSize = '0.9em';
+
+  element.append(details, shStatus);
+}
+
 // Process PLY data after loading
-function processPLYData(plyData: any, fileName: string, loadTime: string, fileSize?: number, infoElement?: HTMLElement) {
+function processPLYData(plyData: PLYData, fileName: string, loadTime: string, fileSize?: number, infoElement?: HTMLElement) {
   if (plyData.sceneCenter && plyData.sceneExtent) {
     currentViewer.setSceneParameters(plyData.sceneCenter, plyData.sceneExtent);
   }
 
   const activeShDegree = requestedShDegree ?? plyData.activeShDegree ?? 1;
+  const requiredRestCount = getRequiredShRestCount(activeShDegree);
+  if (plyData.shRestCount < requiredRestCount) {
+    throw new Error(
+      `SH degree ${activeShDegree} requires ${requiredRestCount} f_rest values per vertex, ` +
+      `but this PLY contains ${plyData.shRestCount}`
+    );
+  }
   currentViewer.setShDegree(activeShDegree);
 
   currentViewer.loadPointCloud(
@@ -114,7 +737,8 @@ function processPLYData(plyData: any, fileName: string, loadTime: string, fileSi
     plyData.octlevels,
     plyData.octpaths,
     plyData.gridValues,
-    plyData.shRestValues
+    plyData.shRestValues,
+    plyData.octpathHighs
   );
 
   let octlevelInfo = '';
@@ -129,12 +753,25 @@ function processPLYData(plyData: any, fileName: string, loadTime: string, fileSi
     Voxels: ${plyData.vertexCount.toLocaleString()}${sizeInfo}
     Load time: ${loadTime}s${octlevelInfo}`;
   
-  // Update the main info display
-  mainInfoDisplay.textContent = infoText;
+  renderModelInfo(
+    mainInfoDisplay,
+    infoText,
+    activeShDegree,
+    requiredRestCount,
+    plyData.shRestCount,
+    activeSampleCount
+  );
   
   // Also update the upload info element if provided
   if (infoElement && infoElement !== mainInfoDisplay) {
-    infoElement.textContent = infoText;
+    renderModelInfo(
+      infoElement,
+      infoText,
+      activeShDegree,
+      requiredRestCount,
+      plyData.shRestCount,
+      activeSampleCount
+    );
   }
 
   // Keep the model in its original orientation by default.
@@ -258,7 +895,7 @@ function addControls() {
     controls.style.padding = '8px';
     controls.style.maxWidth = '150px';
   }
-  
+
   // Add the controls to the document
   document.body.appendChild(controls);
   
@@ -351,9 +988,35 @@ function addPLYUploadUI() {
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
+  const urlParams = new URLSearchParams(window.location.search);
+  const compareMode = urlParams.get('compare');
+  const isCompareChild = urlParams.get('compareChild') === '1';
+  if (!isCompareChild) {
+    const effectiveCompareMode: CompareMode =
+      compareMode === 'sh13' ||
+      compareMode === 'viewdir' ||
+      compareMode === 'tuning' ||
+      compareMode === 'preset'
+        ? compareMode
+        : 'preset';
+    setupCompareLayout(effectiveCompareMode, urlParams);
+    return;
+  }
+
+  const integrationMode =
+    urlParams.get('integrationMode')?.toLowerCase() === 'jittered' ? 'jittered' : 'reference';
+  const quality = (urlParams.get('quality') || '').toLowerCase();
+  const fallbackSamples = integrationMode === 'reference'
+    ? 3
+    : quality === 'detail' ? 12 : quality === 'preview' ? 4 : 8;
+  const requestedSamples = Number.parseInt(urlParams.get('samples') || `${fallbackSamples}`, 10);
+  activeSampleCount = Math.max(1, Math.min(Number.isFinite(requestedSamples) ? requestedSamples : fallbackSamples, 64));
+
   // Create the WebGL viewer
   const viewer = new Viewer('app');
   currentViewer = viewer;
+  applyViewerDefaults(viewer);
+  viewer.setReferenceIntegration(integrationMode === 'reference');
   
   // Get direct access to the camera
   const camera = viewer.getCamera();
@@ -370,9 +1033,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     viewer.resize(width, height);
   });
   
-  // Get URL parameters
-  const urlParams = new URLSearchParams(window.location.search);
   const qualityPreset = (urlParams.get('quality') || '').toLowerCase();
+  const inspectPreset = (urlParams.get('inspect') || '').toLowerCase();
+  const rayMode = urlParams.get('rayMode')?.toLowerCase() === 'legacy' ? 'legacy' : 'exact';
+  viewer.setExactRayMode(rayMode === 'exact');
   const plyUrl = urlParams.get('url') || '/models/SVRaster/bonsai_og/checkpoints/iter020000_model.ply';
   const showLoadingUI = urlParams.get('showLoadingUI') === 'true';
   const shDegreeParam = urlParams.get('sh');
@@ -393,6 +1057,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     viewer.setDensityThreshold(0.08);
     viewer.setVoxelScaleMultiplier(0.92);
     viewer.setStepScale(120.0);
+  }
+
+  if (inspectPreset === 'direction') {
+    viewer.setShComparisonMode('dirdiff');
+    viewer.setShDirDiffScale(14.0);
+    viewer.setRenderScale(1.0);
+  } else if (inspectPreset === 'coverage') {
+    viewer.setDebugRenderMode('thickness');
+    viewer.setBlendingEnabled(false);
+    viewer.setDepthTestEnabled(true);
+    viewer.setCullingEnabled(false);
+    viewer.setVoxelScaleMultiplier(1.03);
+  } else if (inspectPreset === 'leaks') {
+    viewer.setDebugRenderMode('alpha');
+    viewer.setBlendingEnabled(true);
+    viewer.setDepthTestEnabled(false);
+    viewer.setCullingEnabled(false);
+    viewer.setVoxelScaleMultiplier(1.03);
   }
 
   const disableSh2 = urlParams.get('disableSh2');
@@ -433,6 +1115,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       viewer.setDebugRenderMode('solid');
     } else if (normalizedRenderDebug === 'rawdensity') {
       viewer.setDebugRenderMode('rawdensity');
+    } else if (normalizedRenderDebug === 'albedo') {
+      viewer.setDebugRenderMode('albedo');
     } else {
       viewer.setDebugRenderMode('normal');
     }
@@ -443,9 +1127,22 @@ document.addEventListener('DOMContentLoaded', async () => {
     viewer.setStepScale(stepScale);
   }
 
-  const sortMode = urlParams.get('sort');
-  if (sortMode !== null) {
-    viewer.setSortingEnabled(sortMode !== '0' && sortMode.toLowerCase() !== 'false' && sortMode.toLowerCase() !== 'off');
+  const sortMode = (urlParams.get('sortMode') || urlParams.get('sort') || 'depth').toLowerCase();
+  const sortingDisabled = sortMode === '0' || sortMode === 'false' || sortMode === 'off';
+  const activeSortMode = sortingDisabled
+    ? 'off'
+    : sortMode === 'distance' ? 'distance' : sortMode === 'morton' ? 'morton' : 'depth';
+  const requestedCompositeMode = urlParams.get('compositeMode')?.toLowerCase();
+  const activeCompositeMode = requestedCompositeMode === 'front' ||
+    (requestedCompositeMode !== 'back' && activeSortMode === 'morton')
+    ? 'front'
+    : 'back';
+  viewer.setSortingEnabled(!sortingDisabled);
+  viewer.setCompositeMode(activeCompositeMode);
+  if (!sortingDisabled) {
+    viewer.setSortMetric(
+      activeSortMode === 'distance' ? 'distance' : activeSortMode === 'morton' ? 'morton' : 'depth'
+    );
   }
 
   const densityMode = urlParams.get('densityMode');
@@ -480,6 +1177,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     viewer.setRawDensityScale(rawDensityScale);
   }
 
+  const minOct = Number.parseInt(urlParams.get('minOct') || '', 10);
+  const maxOct = Number.parseInt(urlParams.get('maxOct') || '', 10);
+  if (Number.isFinite(minOct) || Number.isFinite(maxOct)) {
+    viewer.setVisibleOctlevelRange(
+      Number.isFinite(minOct) ? minOct : 0,
+      Number.isFinite(maxOct) ? maxOct : 16
+    );
+  }
+
+  const minGridMean = Number.parseFloat(urlParams.get('minGridMean') || '');
+  if (Number.isFinite(minGridMean)) {
+    viewer.setMinGridMean(minGridMean);
+  }
+
   const renderScale = Number.parseFloat(urlParams.get('renderScale') || '');
   if (Number.isFinite(renderScale)) {
     viewer.setRenderScale(renderScale);
@@ -493,6 +1204,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   const depthMode = urlParams.get('depth');
   if (depthMode !== null) {
     viewer.setDepthTestEnabled(depthMode === '1' || depthMode.toLowerCase() === 'true' || depthMode.toLowerCase() === 'on');
+  }
+
+  const cullMode = urlParams.get('cull');
+  if (cullMode !== null) {
+    viewer.setCullingEnabled(!(cullMode === '0' || cullMode.toLowerCase() === 'false' || cullMode.toLowerCase() === 'off'));
   }
 
   const voxelScale = Number.parseFloat(urlParams.get('voxelScale') || '');
@@ -527,4 +1243,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Auto-load the PLY file if showLoadingUI is false
     await loadPLYFromUrl(plyUrl, infoDisplay);
   }
+
+  const initialCameraState = parseCameraState(urlParams.get('compareCamera'));
+  if (initialCameraState) {
+    applyCameraState(camera, initialCameraState);
+  }
+  setupCompareChildSync(camera, urlParams);
 });

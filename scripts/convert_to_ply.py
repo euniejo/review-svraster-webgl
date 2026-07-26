@@ -219,7 +219,7 @@ def convert_to_ply(input_path, output_path, use_cpu=False, sh_layout='auto'):
     # Define attribute list
     attributes = [
         ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),          # positions
-        ('octpath', 'u4'), ('octlevel', 'u1'),    # octree data
+        ('octpath_low', 'u4'), ('octpath_high', 'u4'), ('octlevel', 'u1'),
         ('f_dc_0', 'f4'), ('f_dc_1', 'f4'), ('f_dc_2', 'f4')  # DC components
     ]
     
@@ -238,7 +238,9 @@ def convert_to_ply(input_path, output_path, use_cpu=False, sh_layout='auto'):
     elements['x'] = vox_center[:, 0]
     elements['y'] = vox_center[:, 1]
     elements['z'] = vox_center[:, 2]
-    elements['octpath'] = octpath.astype(np.uint32)
+    octpath_u64 = octpath.astype(np.uint64)
+    elements['octpath_low'] = (octpath_u64 & np.uint64(0xffffffff)).astype(np.uint32)
+    elements['octpath_high'] = (octpath_u64 >> np.uint64(32)).astype(np.uint32)
     elements['octlevel'] = octlevel.astype(np.uint8)
     
     # Fill DC components

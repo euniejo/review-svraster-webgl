@@ -1,3 +1,5 @@
+import { getRequiredShRestCount } from './SphericalHarmonics';
+
 /**
  * LoadPLY utility class for loading specialized binary PLY files with f_dc color data
  */
@@ -5,8 +7,10 @@ export interface PLYData {
   vertices: Float32Array;    // Position data (x, y, z)
   sh0Values: Float32Array;      // Color data from f_dc fields
   octlevels: Uint8Array;    // Octlevel data for scaling
-  octpaths: Uint32Array;    // Octpath data
-  shRestValues: Float32Array | undefined; // f_rest values (0-8)
+  octpaths: Uint32Array;    // Low 32 bits of the octpath
+  octpathHighs: Uint32Array | undefined;
+  shRestValues: Float32Array | undefined;
+  shRestCount: number;
   gridValues: Float32Array; // grid point density values (0-7)
   vertexCount: number;
   sceneCenter: [number, number, number]; // scene center
@@ -112,6 +116,7 @@ export class LoadPLY {
     let sceneCenter: [number, number, number] = [0, 0, 0];
     let sceneExtent: number = 3.0;
     let activeShDegree = 1;
+    let hasActiveShDegreeMetadata = false;
     
     for (const line of lines) {
       const trimmed = line.trim();
@@ -140,6 +145,7 @@ export class LoadPLY {
         const value = parseInt(trimmed.substring('comment active_sh_degree '.length).trim(), 10);
         if (Number.isFinite(value)) {
           activeShDegree = value;
+          hasActiveShDegreeMetadata = true;
           console.log(`Found active SH degree: ${activeShDegree}`);
         }
       }
@@ -199,29 +205,53 @@ export class LoadPLY {
       throw new Error('PLY file missing required octlevel property');
     }
     
-    // Check if the file has octpath property
+    // New files split the 48-bit octpath into two standard PLY uint fields.
     const hasOctpath = properties.some(p => p.name === 'octpath');
+    const hasSplitOctpath =
+      properties.some(p => p.name === 'octpath_low') &&
+      properties.some(p => p.name === 'octpath_high');
     let octpaths: Uint32Array;
+    let octpathHighs: Uint32Array | undefined;
     
-    if (hasOctpath) {
+    if (hasSplitOctpath) {
       octpaths = new Uint32Array(vertexCount);
-      console.log('File has octpath property');
+      octpathHighs = new Uint32Array(vertexCount);
+      console.log('File has split 48-bit octpath properties');
+    } else if (hasOctpath) {
+      octpaths = new Uint32Array(vertexCount);
+      console.log('File has legacy truncated octpath property');
     } else {
-      throw new Error('PLY file missing required octpath property');
+      throw new Error('PLY file missing required octpath properties');
     }
     
     // Check if the file has f_rest properties
-    const hasRestValues = properties.some(p => p.name.startsWith('f_rest_'));
+    const restProperties = properties.filter(p => p.name.startsWith('f_rest_'));
+    const restCount = restProperties.length;
+    const hasRestValues = restCount > 0;
     let restValues: Float32Array | undefined;
     
     if (hasRestValues) {
-      // Count how many f_rest properties are present (should be 9 from f_rest_0 to f_rest_8)
-      const restCount = properties.filter(p => p.name.startsWith('f_rest_')).length;
+      const restPropertyNames = new Set(restProperties.map(p => p.name));
+      for (let index = 0; index < restCount; index++) {
+        if (!restPropertyNames.has(`f_rest_${index}`)) {
+          throw new Error(`PLY SH properties must be contiguous; missing f_rest_${index}`);
+        }
+      }
       restValues = new Float32Array(vertexCount * restCount);
       console.log(`File has ${restCount} f_rest properties`);
     } else {
       console.log('PLY file missing f_rest values. No directional lighting will be visible.');
       restValues = undefined;
+    }
+
+    if (hasActiveShDegreeMetadata) {
+      const requiredRestCount = getRequiredShRestCount(activeShDegree);
+      if (restCount < requiredRestCount) {
+        throw new Error(
+          `PLY declares SH degree ${activeShDegree}, which requires ${requiredRestCount} ` +
+          `f_rest values per vertex, but only ${restCount} are present`
+        );
+      }
     }
     
     // Check if the file has grid value properties
@@ -304,7 +334,10 @@ export class LoadPLY {
       }
       
       // Read octpath if present
-      if (hasOctpath && octpaths && propertyOffsets['octpath'] !== undefined) {
+      if (hasSplitOctpath && octpathHighs) {
+        octpaths[i] = dataView.getUint32(vertexOffset + propertyOffsets['octpath_low'], true);
+        octpathHighs[i] = dataView.getUint32(vertexOffset + propertyOffsets['octpath_high'], true);
+      } else if (hasOctpath && propertyOffsets['octpath'] !== undefined) {
         octpaths[i] = dataView.getUint32(vertexOffset + propertyOffsets['octpath'], true);
       }
       
@@ -321,7 +354,6 @@ export class LoadPLY {
 
       // Read f_rest values if present
       if (hasRestValues && restValues) {
-        const restCount = properties.filter(p => p.name.startsWith('f_rest_')).length;
         for (let r = 0; r < restCount; r++) {
           const propName = `f_rest_${r}`;
           if (propertyOffsets[propName] !== undefined) {
@@ -343,7 +375,9 @@ export class LoadPLY {
       sh0Values: sh0s,
       octlevels,
       octpaths,
+      octpathHighs,
       shRestValues: restValues,
+      shRestCount: restCount,
       gridValues,
       vertexCount,
       sceneCenter,

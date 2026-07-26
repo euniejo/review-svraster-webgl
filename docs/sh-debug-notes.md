@@ -1,81 +1,72 @@
-# SVRaster WebGL Viewer - SH / Rendering Debug Notes
+# SVRaster Viewer 실험 기록
 
-## 현재 상태
+이 문서는 문제 분석 과정에서 수행한 실험을 시간 순서와 가설 중심으로 남기는 작업 기록이다.
+검증 범위와 최종 판단은 [PLY Viewer 품질 점검 보고서](./ply-viewer-final-summary.md)를 기준으로 한다.
 
-로컬 bonsai PLY를 기준으로 뷰어를 디버깅했으며, 현재는 모델이 화면에 보이고 `sh=2` 모드도 동작합니다. 다만 SH2를 켠 상태에서 화질이 아직 충분하지 않아, 계수 매핑과 샘플링 쪽을 더 점검해야 합니다.
+## 문제 정의
 
-## 이미 해결한 문제
+로컬에서 PLY로 변환한 SVRaster 모델에 다음 현상이 관찰됐다.
 
-### 1. 로컬 PLY 로딩 경로 확인
+- 모델 표면의 점상 노이즈와 사선 형태의 아티팩트
+- 카메라 이동 시 불안정한 화면 변화
+- 모델 실루엣과 색상 정보의 소실
+- debug view에서 복셀 proxy가 화면 대부분을 차지하는 현상
 
-- `models/SVRaster/bonsai_og/checkpoints/iter020000_model.ply`가 실제로 존재하고, Vite dev server에서도 `200 OK`로 서빙되는 것을 확인했습니다.
-- 따라서 렌더 실패의 원인은 파일 경로가 아니라 뷰어 내부 렌더링 쪽이었습니다.
+점검 목적은 SH 차수, density 해석, ray integration, proxy coverage 중 어떤 경로를 우선 조사해야 하는지 좁히는 것이었다.
 
-### 2. 화면이 완전히 검게 보이던 문제 수정
+## 실험 기록
 
-- 셰이더 링크 실패가 있었습니다.
-- vertex shader는 `precision highp float`인데 fragment shader는 `precision mediump float`라서, `uCameraPosition` uniform 정밀도 불일치로 링크가 실패했습니다.
-- fragment shader도 `highp`로 맞춰서 해결했습니다.
+| 단계 | 가설 | 조정 항목 | 관찰 | 현재 해석 |
+| --- | --- | --- | --- | --- |
+| 1 | SH 차수가 낮다 | `sh=1`, `2`, `3` | 고차 SH에서도 의미 있는 개선이 없고 일부 시점에서 백색 포화 증가 | SH 적용 여부와 현재 품질 문제는 별개 |
+| 2 | SH 방향 규약이 반대다 | `shDebug=dirDiff`, `shViewDir` | 방향 반전에 따른 색 차이가 크게 나타남 | 기준 렌더가 없어 올바른 방향은 판정 불가 |
+| 3 | trilinear 보간이 노이즈를 만든다 | `densityMode=trilinear`, `flat` | flat에서도 모델 식별성과 노이즈가 개선되지 않음 | 보간 방식만의 문제라는 가설은 지지되지 않음 |
+| 4 | density transfer가 과도하다 | `explin`, `linear`, `exp` | linear는 일부 시점에서 블록 경계 감소, exp는 sparse speckle 증가 | linear만 후속 비교 후보로 유지 |
+| 5 | 적분 샘플이 부족하다 | `samples=3`, `8` | 미세한 안정화 외에 큰 개선 없음 | 보조 변수로만 유지 |
+| 6 | alpha 또는 proxy coverage가 과도하다 | `alpha`, `thickness`, `solid` debug | 모델 형태보다 복셀 경계와 화면 점유가 우세함 | coverage와 density/alpha compositing을 우선 점검 |
+| 7 | coarse octlevel이 문제다 | `minOct`, `maxOct` | 높은 octlevel만 남겨도 전체 품질이 개선되지 않음 | 특정 octlevel만의 문제는 아님 |
+| 8 | 저평균 density voxel을 제거하면 개선된다 | `minGridMean` | 중심부 일부만 남고 모델 소실과 배경 speckle 지속 | 유효한 occupancy 판별 기준으로 확인되지 않음 |
+| 9 | 카메라 초기 위치가 문제다 | 카메라 거리 변경 | 거리가 멀어질수록 판독만 어려워짐 | 렌더링 문제에 대한 추가 근거 없음 |
 
-### 3. 카메라/변환 때문에 모델이 화면 밖으로 밀리던 문제 수정
+## Debug view 해석
 
-- 이전에는 펌킨 씬 기준의 hardcoded transform/camera 값이 남아 있었습니다.
-- bonsai 모델 기준으로는 이 값들이 시야를 크게 벗어나게 만들 수 있어서, 기본 카메라를 scene center 기준으로 다시 잡도록 바꿨습니다.
+### Alpha Debug
 
-### 4. 텍스처 패킹 폭 계산 보정
+최종 alpha를 흑백으로 표시한다. 복셀 경계가 강하게 드러났지만 이 화면만으로 density 원본값, transfer 함수, compositing 순서 중 어느 단계가 원인인지는 구분할 수 없다.
 
-- SH/그리드 데이터를 RGBA 텍스처로 업로드할 때, 요소 개수 기준으로 폭을 잡는 방식이 불안정했습니다.
-- 현재는 RGBA texel 개수 기준으로 폭/높이를 계산하도록 수정했습니다.
+### Thickness Debug
 
-### 5. SH2 디버그용 분리 스위치 추가
+ray와 복셀 박스의 교차 길이를 표시한다. 화면 대부분이 높은 값으로 덮이는 현상은 proxy coverage 진단에 유용하지만 최종 opacity를 직접 나타내지는 않는다.
 
-- `disableSh2` URL 파라미터를 추가했습니다.
-- `?sh=2&disableSh2=true`는 SH2를 끈 비교용 모드입니다.
-- `?sh=2&disableSh2=false`는 SH2를 실제로 계산하는 모드입니다.
+### Solid Debug
 
-## 현재 추가된 디버그 URL
+density를 제외하고 ray와 교차한 proxy를 불투명하게 표시한다. 거의 백색인 결과는 많은 proxy가 화면을 점유한다는 뜻이지만, 해당 proxy가 학습 데이터상 잘못된 voxel이라고 단정할 수는 없다.
 
-- `?url=<PLY URL>`: PLY 파일 지정
-- `?sh=2`: SH degree 2 모드
-- `?disableSh2=true|false`: SH2 항만 디버그로 끄기/켜기
-- `?sh1map=0,1,2`: SH1 basis permutation
-- `?sh2map=0,1,2,3,4`: SH2 basis permutation
+### Albedo Debug
 
-## 현재 남은 문제
+alpha discard를 통과한 fragment의 SH 색상을 불투명하게 표시한다. 이전 실험은 SH3, octlevel, grid mean, threshold가 함께 적용돼 변수별 영향을 해석할 수 없었다. 현재 프리셋은 SH1과 최소한의 depth/blend 설정만 사용하도록 수정됐다.
 
-### 1. SH2 화질이 아직 충분하지 않음
+## UI에 유지한 프리셋
 
-- `disableSh2=true`와 `disableSh2=false` 둘 다 모델은 보이지만, 색과 형태의 차이가 크지 않거나 자연스럽지 않습니다.
-- 즉, 단순히 SH2를 켰다고 바로 품질이 좋아지는 상태는 아닙니다.
+상시 비교 가치가 있는 실험만 드롭다운에 유지한다.
 
-### 2. SH basis mapping 후보가 아직 결정되지 않음
+| 그룹 | 프리셋 |
+| --- | --- |
+| `Quality Tests` | `Linear Only`, `Samples x8`, `SH3 Only`, `Flat Density`, `Linear + Samples x8` |
+| `Render Diagnostics` | `Alpha Debug`, `Albedo Debug`, `Thickness Debug`, `Solid Debug` |
 
-- SH1/SH2 basis 순서를 URL로 바꿔가며 확인할 수 있게 만들었습니다.
-- 하지만 현재 확인된 6개 후보는 서로 크게 다르게 보이지 않았고, 최적 조합을 아직 확정하지 못했습니다.
+`SH2`, `exp`, `RawDensity`, octlevel 제한, `minGridMean`은 실험 기록에는 남기되 상시 프리셋에서는 제외했다.
 
-### 3. 다음에 점검할 후보
+## 다음 검증 우선순위
 
-- SH 계수와 basis의 대응 순서 재검증
-- SH 계산을 vertex가 아니라 fragment 쪽으로 옮기는 실험
-- 샘플 수(`samples`)와 density 스케일 재조정
-- scene extent에 따른 기본 카메라 거리/복셀 스케일 추가 보정
-
-## 최근 기본값 조정
-
-- `samples` 기본값을 `3`에서 `8`로 올렸습니다.
-- 목적은 `sh=1`에서 복셀 내부 적분이 너무 거칠어서 생기던 줄무늬/지글거림을 먼저 줄이는 것입니다.
-- 성능이 더 중요하면 `?samples=3` 또는 `?samples=1`로 다시 낮춰 비교할 수 있습니다.
-- 추가로 샘플 위치에 지터를 넣어 얇은 구조물에서 생기던 규칙적인 줄무늬를 완화했습니다.
-- `?quality=detail` 프리셋을 추가해 더 높은 기본 샘플 수와 sharper density preset을 바로 비교할 수 있게 했습니다.
-
-## 검증 결과
-
-- `npm run build` 통과
-- dev server에서 로컬 bonsai PLY 로딩 가능
-- 렌더가 검은 화면에서 벗어나 모델 표시 가능
+1. 동일한 카메라에서 PT 기준 렌더와 WebGL 결과를 캡처한다.
+2. 기준 구현과 WebGL의 density transfer, ray step length, alpha 식을 수식 단위로 대조한다.
+3. 동일 시점의 silhouette coverage, 배경 오염 픽셀 비율, 색상 오차를 측정한다.
+4. 필요하면 PT와 PLY에서 동일 voxel의 octpath, 8개 grid 값, SH coefficient를 샘플링해 직접 비교한다.
 
 ## 관련 파일
 
+- [최종 점검 보고서](./ply-viewer-final-summary.md)
 - [src/main.ts](../src/main.ts)
 - [src/lib/Viewer.ts](../src/lib/Viewer.ts)
 - [scripts/convert_to_ply.py](../scripts/convert_to_ply.py)

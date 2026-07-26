@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# Large local model data and machine-specific proxy config
+models/
+Caddyfile
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
