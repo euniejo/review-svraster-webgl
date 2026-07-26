@@ -64,6 +64,16 @@ interface CompareCameraMessage {
   state: CameraState;
 }
 
+interface LocalPlyReadyMessage {
+  type: 'local-ply-ready';
+  pane: 'left' | 'right';
+}
+
+interface LoadLocalPlyMessage {
+  type: 'load-local-ply';
+  file: File;
+}
+
 interface TestPreset {
   id: string;
   label: string;
@@ -311,6 +321,8 @@ function buildComparePaneUrl(
   params.set('compareChild', '1');
   params.set('comparePane', pane);
   params.set('compareChannel', channelId);
+  // The comparison parent owns local file selection and forwards it to both panes.
+  params.set('localFile', '1');
   return `${window.location.pathname}?${params.toString()}`;
 }
 
@@ -633,10 +645,79 @@ function setupCompareLayout(compareMode: CompareMode, urlParams: URLSearchParams
   document.body.appendChild(header);
 
   const getLatestCameraState = initCompareSync(channelId, leftPane.iframe, rightPane.iframe);
+  addLocalPlyLoader(leftPane.iframe, rightPane.iframe);
 
   if (compareMode === 'preset') {
     addPresetCompareController(urlParams, channelId, rightPane, getLatestCameraState);
   }
+}
+
+function addLocalPlyLoader(leftFrame: HTMLIFrameElement, rightFrame: HTMLIFrameElement): void {
+  const panel = document.createElement('div');
+  panel.style.position = 'fixed';
+  panel.style.top = '12px';
+  panel.style.left = '12px';
+  panel.style.zIndex = '20';
+  panel.style.display = 'flex';
+  panel.style.alignItems = 'center';
+  panel.style.gap = '8px';
+  panel.style.padding = '8px 10px';
+  panel.style.borderRadius = '8px';
+  panel.style.background = 'rgba(0, 0, 0, 0.76)';
+  panel.style.color = 'white';
+  panel.style.fontFamily = 'sans-serif';
+  panel.style.fontSize = '12px';
+
+  const label = document.createElement('label');
+  label.textContent = 'Local PLY';
+  label.style.fontWeight = '600';
+
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.ply,application/octet-stream';
+  input.style.maxWidth = '220px';
+
+  const status = document.createElement('span');
+  status.textContent = 'Select a PLY file to load both panes.';
+  status.style.opacity = '0.8';
+
+  panel.append(label, input, status);
+  document.body.appendChild(panel);
+
+  let selectedFile: File | null = null;
+  const sendFile = (frame: HTMLIFrameElement) => {
+    if (!selectedFile || !frame.contentWindow) {
+      return;
+    }
+    const message: LoadLocalPlyMessage = { type: 'load-local-ply', file: selectedFile };
+    frame.contentWindow.postMessage(message, window.location.origin);
+  };
+
+  window.addEventListener('message', (event: MessageEvent) => {
+    if (event.origin !== window.location.origin || event.source === window) {
+      return;
+    }
+    const data = event.data as LocalPlyReadyMessage | undefined;
+    if (data?.type !== 'local-ply-ready') {
+      return;
+    }
+    if (event.source === leftFrame.contentWindow) {
+      sendFile(leftFrame);
+    } else if (event.source === rightFrame.contentWindow) {
+      sendFile(rightFrame);
+    }
+  });
+
+  input.addEventListener('change', () => {
+    const file = input.files?.[0];
+    if (!file) {
+      return;
+    }
+    selectedFile = file;
+    status.textContent = `${file.name} selected. Loading both panes locally...`;
+    sendFile(leftFrame);
+    sendFile(rightFrame);
+  });
 }
 
 function setupCompareChildSync(camera: Camera, urlParams: URLSearchParams) {
@@ -1039,6 +1120,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   viewer.setExactRayMode(rayMode === 'exact');
   const plyUrl = urlParams.get('url') || '/models/SVRaster/bonsai_og/checkpoints/iter020000_model.ply';
   const showLoadingUI = urlParams.get('showLoadingUI') === 'true';
+  const waitForLocalFile = urlParams.get('localFile') === '1';
   const shDegreeParam = urlParams.get('sh');
   if (shDegreeParam !== null) {
     const shDegree = parseInt(shDegreeParam, 10);
@@ -1233,8 +1315,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Create progress bar
   createProgressBar();
 
-  // Only add PLY upload UI if showLoadingUI is true
-  if (showLoadingUI) {
+  if (waitForLocalFile) {
+    infoDisplay.textContent = 'Waiting for a local PLY file selection...';
+    window.addEventListener('message', async (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) {
+        return;
+      }
+      const data = event.data as LoadLocalPlyMessage | undefined;
+      if (data?.type !== 'load-local-ply' || !(data.file instanceof File)) {
+        return;
+      }
+      await loadPLYFromFile(data.file, infoDisplay);
+    });
+  } else if (showLoadingUI) {
     // Add UI 
     addPLYUploadUI();
     // Set initial info text
@@ -1249,4 +1342,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     applyCameraState(camera, initialCameraState);
   }
   setupCompareChildSync(camera, urlParams);
+
+  if (waitForLocalFile && window.parent !== window) {
+    const pane = urlParams.get('comparePane');
+    if (pane === 'left' || pane === 'right') {
+      const message: LocalPlyReadyMessage = { type: 'local-ply-ready', pane };
+      window.parent.postMessage(message, window.location.origin);
+    }
+  }
 });
