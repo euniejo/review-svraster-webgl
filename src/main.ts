@@ -364,9 +364,10 @@ function createComparePane(
   wrapper.style.borderLeft = pane === 'right' ? '1px solid rgba(255,255,255,0.14)' : 'none';
 
   const badge = document.createElement('div');
+  badge.className = 'compare-pane-badge';
   badge.textContent = label;
   badge.style.position = 'absolute';
-  badge.style.top = '12px';
+  badge.style.bottom = '12px';
   badge.style.left = '12px';
   badge.style.zIndex = '2';
   badge.style.padding = '6px 10px';
@@ -418,46 +419,19 @@ function addPresetCompareController(
   urlParams: URLSearchParams,
   channelId: string,
   rightPane: { wrapper: HTMLDivElement; iframe: HTMLIFrameElement },
-  getLatestCameraState: () => CameraState | null
+  getLatestCameraState: () => CameraState | null,
+  host: HTMLElement
 ): void {
   const selectedPreset =
     TEST_PRESETS.find((preset) => preset.id === urlParams.get('comparePreset')) ?? TEST_PRESETS[1];
 
   const panel = document.createElement('div');
-  panel.style.position = 'fixed';
-  panel.style.top = '12px';
-  panel.style.right = '12px';
-  panel.style.zIndex = '12';
-  panel.style.width = '280px';
-  panel.style.padding = '10px';
-  panel.style.borderRadius = '10px';
-  panel.style.background = 'rgba(0, 0, 0, 0.72)';
-  panel.style.color = 'white';
-  panel.style.fontFamily = 'sans-serif';
-  panel.style.backdropFilter = 'blur(10px)';
-  panel.style.maxHeight = 'calc(100vh - 24px)';
-  panel.style.overflowY = 'auto';
-
-  const title = document.createElement('div');
-  title.textContent = 'Preset Compare';
-  title.style.fontSize = '13px';
-  title.style.fontWeight = '600';
-  title.style.marginBottom = '6px';
-
-  const subtitle = document.createElement('div');
-  subtitle.textContent = 'Left stays on the SH1 baseline. Only the right preset reloads.';
-  subtitle.style.fontSize = '12px';
-  subtitle.style.opacity = '0.82';
-  subtitle.style.marginBottom = '8px';
+  panel.className = 'compare-preset-panel';
 
   const select = document.createElement('select');
-  select.style.width = '100%';
-  select.style.padding = '6px 8px';
-  select.style.borderRadius = '6px';
-  select.style.border = '1px solid rgba(255,255,255,0.18)';
-  select.style.background = 'rgba(255,255,255,0.08)';
-  select.style.color = 'white';
-  select.style.marginBottom = '8px';
+  select.className = 'compare-preset-select';
+  select.ariaLabel = 'Right pane test preset';
+  select.title = selectedPreset.description;
 
   const groupLabels: Record<Exclude<PresetGroup, 'baseline'>, string> = {
     quality: 'Quality Tests',
@@ -476,18 +450,12 @@ function addPresetCompareController(
     select.appendChild(optionGroup);
   }
 
-  const description = document.createElement('div');
-  description.style.fontSize = '12px';
-  description.style.opacity = '0.86';
-  description.style.minHeight = '2.4em';
-  description.style.marginBottom = '8px';
-
   const rightBadge = rightPane.wrapper.querySelector('div');
 
   const setPreset = (presetId: string) => {
     const preset = TEST_PRESETS.find((item) => item.id === presetId) ?? TEST_PRESETS[1];
-    description.textContent = preset.description;
     select.value = preset.id;
+    select.title = preset.description;
     const cameraState = getLatestCameraState();
     const overrides = {
       ...preset.overrides,
@@ -504,10 +472,8 @@ function addPresetCompareController(
   };
 
   select.addEventListener('change', () => setPreset(select.value));
-  description.textContent = selectedPreset.description;
-
-  panel.append(title, subtitle, select, description);
-  document.body.appendChild(panel);
+  panel.appendChild(select);
+  host.appendChild(panel);
 }
 
 function setupCompareLayout(compareMode: CompareMode, urlParams: URLSearchParams) {
@@ -518,9 +484,9 @@ function setupCompareLayout(compareMode: CompareMode, urlParams: URLSearchParams
 
   document.body.style.margin = '0';
   document.body.style.background = '#050505';
+  document.body.classList.add('compare-shell');
   root.innerHTML = '';
-  root.style.width = '100vw';
-  root.style.height = '100vh';
+  root.className = 'compare-grid';
   root.style.display = 'grid';
   root.style.gridTemplateColumns = '1fr 1fr';
   root.style.background = '#050505';
@@ -628,45 +594,30 @@ function setupCompareLayout(compareMode: CompareMode, urlParams: URLSearchParams
   root.appendChild(leftPane.wrapper);
   root.appendChild(rightPane.wrapper);
 
+  const toolbar = document.createElement('div');
+  toolbar.className = 'compare-toolbar';
+
   const header = document.createElement('div');
+  header.className = 'compare-header';
   header.textContent = 'Split Compare: drag either side to sync both cameras';
-  header.style.position = 'fixed';
-  header.style.top = '12px';
-  header.style.left = '50%';
-  header.style.transform = 'translateX(-50%)';
-  header.style.zIndex = '10';
-  header.style.padding = '8px 12px';
-  header.style.borderRadius = '999px';
-  header.style.background = 'rgba(0, 0, 0, 0.72)';
-  header.style.color = 'white';
-  header.style.fontFamily = 'sans-serif';
-  header.style.fontSize = '12px';
-  header.style.pointerEvents = 'none';
-  document.body.appendChild(header);
+  document.body.appendChild(toolbar);
+  toolbar.appendChild(header);
 
   const getLatestCameraState = initCompareSync(channelId, leftPane.iframe, rightPane.iframe);
-  addLocalPlyLoader(leftPane.iframe, rightPane.iframe);
+  addLocalPlyLoader(leftPane.iframe, rightPane.iframe, toolbar);
 
   if (compareMode === 'preset') {
-    addPresetCompareController(urlParams, channelId, rightPane, getLatestCameraState);
+    addPresetCompareController(urlParams, channelId, rightPane, getLatestCameraState, toolbar);
   }
 }
 
-function addLocalPlyLoader(leftFrame: HTMLIFrameElement, rightFrame: HTMLIFrameElement): void {
+function addLocalPlyLoader(
+  leftFrame: HTMLIFrameElement,
+  rightFrame: HTMLIFrameElement,
+  host: HTMLElement
+): void {
   const panel = document.createElement('div');
-  panel.style.position = 'fixed';
-  panel.style.top = '12px';
-  panel.style.left = '12px';
-  panel.style.zIndex = '20';
-  panel.style.display = 'flex';
-  panel.style.alignItems = 'center';
-  panel.style.gap = '8px';
-  panel.style.padding = '8px 10px';
-  panel.style.borderRadius = '8px';
-  panel.style.background = 'rgba(0, 0, 0, 0.76)';
-  panel.style.color = 'white';
-  panel.style.fontFamily = 'sans-serif';
-  panel.style.fontSize = '12px';
+  panel.className = 'local-ply-loader';
 
   const label = document.createElement('label');
   label.textContent = 'Local PLY';
@@ -675,14 +626,15 @@ function addLocalPlyLoader(leftFrame: HTMLIFrameElement, rightFrame: HTMLIFrameE
   const input = document.createElement('input');
   input.type = 'file';
   input.accept = '.ply,application/octet-stream';
-  input.style.maxWidth = '220px';
+  input.className = 'local-ply-input';
 
   const status = document.createElement('span');
   status.textContent = 'Select a PLY file to load both panes.';
-  status.style.opacity = '0.8';
+  status.title = status.textContent;
+  status.className = 'local-ply-status';
 
   panel.append(label, input, status);
-  document.body.appendChild(panel);
+  host.prepend(panel);
 
   let selectedFile: File | null = null;
   const sendFile = (frame: HTMLIFrameElement) => {
@@ -715,6 +667,7 @@ function addLocalPlyLoader(leftFrame: HTMLIFrameElement, rightFrame: HTMLIFrameE
     }
     selectedFile = file;
     status.textContent = `${file.name} selected. Loading both panes locally...`;
+    status.title = status.textContent;
     sendFile(leftFrame);
     sendFile(rightFrame);
   });

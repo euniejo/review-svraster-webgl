@@ -30,6 +30,134 @@ body {
   min-height: 100vh;
 }
 
+body.compare-shell {
+  --compare-toolbar-height: 68px;
+  display: block;
+  overflow: hidden;
+  background: #050505;
+}
+
+.compare-toolbar {
+  position: fixed;
+  inset: 0 0 auto;
+  z-index: 20;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(240px, 1fr);
+  align-items: center;
+  gap: 16px;
+  height: var(--compare-toolbar-height);
+  padding: 10px 14px;
+  box-sizing: border-box;
+  color: #fff;
+  background: rgba(8, 10, 9, 0.96);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.16);
+  font-family: Avenir, Helvetica, sans-serif;
+}
+
+.compare-grid {
+  position: fixed;
+  inset: var(--compare-toolbar-height) 0 0;
+  width: auto;
+  height: auto;
+}
+
+.local-ply-loader {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.local-ply-loader label {
+  flex: 0 0 auto;
+  font-weight: 600;
+}
+
+.local-ply-input {
+  flex: 0 1 190px;
+  min-width: 110px;
+  max-width: 190px;
+}
+
+.local-ply-status {
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.72);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.compare-header {
+  justify-self: center;
+  padding: 7px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.82);
+  background: rgba(255, 255, 255, 0.07);
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.compare-preset-panel {
+  justify-self: end;
+  width: min(100%, 280px);
+  min-width: 0;
+}
+
+.compare-preset-select {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 7px;
+  color: #fff;
+  background: #202422;
+  font: inherit;
+}
+
+@media (max-width: 1050px) {
+  .compare-toolbar {
+    grid-template-columns: minmax(0, 1fr) minmax(220px, 280px);
+  }
+
+  .compare-header {
+    display: none;
+  }
+}
+
+@media (max-width: 700px) {
+  body.compare-shell {
+    --compare-toolbar-height: 112px;
+  }
+
+  .compare-toolbar {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    padding: 8px 10px;
+  }
+
+  .compare-preset-panel {
+    justify-self: stretch;
+    width: 100%;
+  }
+
+  .local-ply-input {
+    flex-basis: 160px;
+    max-width: 160px;
+  }
+
+  .compare-pane-badge {
+    max-width: calc(100% - 44px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
 h1 {
   font-size: 3.2em;
   line-height: 1.1;
